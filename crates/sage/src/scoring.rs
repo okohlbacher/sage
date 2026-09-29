@@ -439,6 +439,31 @@ impl<'db> Scorer<'db> {
                 }
             })
             .collect::<Vec<_>>();
+        // All windows' dense candidate arrays are alive at once here, versus one at a time
+        // in the per-window path. For very wide (Da) precursor windows that can be GBs
+        // per thread, so fall back to one window at a time above ~4 M candidates.
+        const MAX_FUSED_CANDIDATES: usize = 1 << 22;
+        if windows
+            .iter()
+            .map(|w| w.hits.preliminary.len())
+            .sum::<usize>()
+            > MAX_FUSED_CANDIDATES
+        {
+            drop(windows);
+            return (self.min_isotope_err..=self.max_isotope_err).fold(
+                InitialHits::default(),
+                |mut hits, isotope| {
+                    hits += self.matched_peaks_with_isotope(
+                        query,
+                        precursor_mass,
+                        precursor_charge,
+                        precursor_tol,
+                        isotope,
+                    );
+                    hits
+                },
+            );
+        }
         let union_lo = windows.iter().map(|w| w.idx_lo).min().unwrap_or_default();
         let union_hi = windows.iter().map(|w| w.idx_hi).max().unwrap_or_default();
 
@@ -456,7 +481,8 @@ impl<'db> Scorer<'db> {
                 for page in page_lo..page_hi {
                     let (inner_lo, inner_hi) = db.page_range(page, union_lo, union_hi);
                     for frag in &db.fragments[inner_lo..inner_hi] {
-                        if frag.fragment_mz < fragment_lo || frag.fragment_mz > fragment_hi {
+                        // same (positive) predicate as `page_search`, so NaN never matches
+                        if !(frag.fragment_mz >= fragment_lo && frag.fragment_mz <= fragment_hi) {
                             continue;
                         }
                         let ix = frag.peptide_index.0 as usize;
@@ -991,7 +1017,11 @@ mod tests {
             mz,
             ..Default::default()
         };
-        let query = SpectrumProcessor::new(150, false, 0.0).process(raw);
+        let mut query = SpectrumProcessor::new(150, false, 0.0).process(raw);
+        // a non-finite peak must not match anything in either path
+        query.masses.push(f32::NAN);
+        query.intensities.push(1.0);
+        query.charges.push(1);
 
         for (precursor_tol, fragment_tol) in [
             (Tolerance::Ppm(-10.0, 10.0), Tolerance::Ppm(-20.0, 20.0)),

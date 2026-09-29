@@ -440,6 +440,25 @@ impl SpectrumProcessor {
             .mobility
             .as_ref()
             .is_some_and(|m| m.len() != spectrum.mz.len());
+        // Non-finite peaks (corrupt arrays) would poison sorting and matching
+        if spectrum.mobility.is_none()
+            && spectrum
+                .mz
+                .iter()
+                .zip(&spectrum.intensity)
+                .any(|(mz, int)| !mz.is_finite() || !int.is_finite())
+            && spectrum.mz.len() == spectrum.intensity.len()
+        {
+            let (mz, intensity): (Vec<f32>, Vec<f32>) = spectrum
+                .mz
+                .iter()
+                .zip(&spectrum.intensity)
+                .filter(|(mz, int)| mz.is_finite() && int.is_finite())
+                .map(|(mz, int)| (*mz, *int))
+                .unzip();
+            spectrum.mz = mz;
+            spectrum.intensity = intensity;
+        }
         if spectrum.mz.len() != spectrum.intensity.len() || mobility_mismatch {
             warn_once(&LENGTH_WARNED, || {
                 format!(
@@ -528,6 +547,14 @@ mod test {
 
         let profile = sp.process(ms2(Representation::Profile, peaks.clone(), vec![1.0; 3]));
         assert!(profile.masses.is_empty());
+
+        // non-finite peaks are dropped
+        let nan = sp.process(ms2(
+            Representation::Centroid,
+            vec![100.0, f32::NAN, 300.0],
+            vec![1.0, 1.0, f32::INFINITY],
+        ));
+        assert_eq!(nan.masses.len(), 1);
 
         // intensity array shorter than m/z: used to index out of bounds in deisotoping
         let short = sp.process(ms2(Representation::Centroid, peaks, vec![1.0; 2]));
