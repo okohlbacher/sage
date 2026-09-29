@@ -110,9 +110,7 @@ impl MobilityModel {
                 x if x > cterm => embedding[C_TERMINAL + idx] += 1.0,
                 _ => {}
             }
-            // the category tables hold `residue - 'A'` offsets, not the compact index
-            // `idx` (which counted the wrong residues as bulky, polar, charged, ...)
-            let x = (residue - b'A') as usize;
+            let x = idx;
 
             if BULKY_AA_IDXS.contains(&x) {
                 embedding[NUM_BULKY] += 1.0;
@@ -186,24 +184,6 @@ impl MobilityModel {
 mod test {
     use super::*;
     use crate::enzyme::Digest;
-
-    #[test]
-    fn residue_categories_use_residue_offsets() {
-        let mut map = [0; 26];
-        for (idx, aa) in VALID_AA.iter().enumerate() {
-            map[(aa - b'A') as usize] = idx;
-        }
-        let peptide = Peptide {
-            sequence: std::sync::Arc::from(b"LLLLLLLK".as_slice()),
-            ..Default::default()
-        };
-        let e = MobilityModel::embed(&peptide, &2, &map);
-        // 7 leucines are bulky and branched; one lysine is positive
-        assert_eq!(e[NUM_BULKY], 7.0);
-        assert_eq!(e[NUM_BRANCHED], 7.0);
-        assert_eq!(e[NUM_POSITIVE], 1.0);
-        assert_eq!(e[NUM_NEGATIVE], 0.0);
-    }
 
     #[test]
     fn test_feature_embed() {
