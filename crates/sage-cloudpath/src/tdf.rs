@@ -136,7 +136,9 @@ impl TdfReader {
                             precursors: vec![precursor],
                             representation: Representation::Centroid,
                             scan_start_time: dda_precursor.rt as f32 / 60.0,
-                            ion_injection_time: dda_precursor.rt as f32,
+                            // timsrust does not expose the accumulation time; this used to
+                            // be filled with the retention time (seconds)
+                            ion_injection_time: f32::NAN,
                             total_ion_current: 0.0,
                             mz: dda_spectrum.mz_values.iter().map(|&x| x as f32).collect(),
                             ms_level: 2,
