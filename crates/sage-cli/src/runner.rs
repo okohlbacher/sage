@@ -618,6 +618,11 @@ impl Runner {
             run_time,
         );
 
+        // `run` is the last thing the process does. Freeing ~10^7 peptides (several
+        // heap allocations each) one by one takes seconds on a single thread
+        // (3 s for human tryptic); let the OS reclaim the memory at exit instead.
+        std::mem::forget(std::mem::take(&mut self.database));
+
         Ok(telemetry)
     }
     pub fn serialize_feature(&self, feature: &Feature, filenames: &[String]) -> csv::ByteRecord {
