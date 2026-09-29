@@ -19,7 +19,8 @@ impl Default for DefaultParams {
         Self {
             is_query_start: false,
             file_id: 0,
-            regex_for_charge: Regex::new(r"(\d)\+?").unwrap(),
+            // whole numbers ("10+" is charge 10, not 1 and 0); the sign is ignored
+            regex_for_charge: Regex::new(r"(\d+)\s*[+-]?").unwrap(),
             tol: None,
             tol_unit: None,
             charge_array: None,
@@ -90,15 +91,15 @@ impl QueryData {
         for precursor in &mut self.precursors {
             precursor.isolation_window = isolation_window;
 
-            if let Some(charge_array) = &self.precursor_charge_array {
-                for &charge in charge_array.iter() {
-                    let mut precursor_with_charge = precursor.clone();
-                    precursor_with_charge.charge = Some(charge);
-                    new_precursors.push(precursor_with_charge);
-                }
-            } else {
-                new_precursors.push(precursor.clone());
-            }
+            // Several candidate charges ("2+ and 3+") used to become one precursor per
+            // charge, but only the first precursor is searched, so the others were lost.
+            // An unknown charge makes Sage search its configured charge range instead.
+            let mut precursor = precursor.clone();
+            precursor.charge = match self.precursor_charge_array.as_deref() {
+                Some([charge]) => Some(*charge),
+                _ => None,
+            };
+            new_precursors.push(precursor);
         }
         new_precursors
     }
@@ -124,6 +125,16 @@ impl QueryData {
         }
         Ok(true)
     }
+}
+
+/// Charges listed in a `CHARGE=` value; `None` if none is given (unknown charge)
+fn parse_charges(regex: &Regex, value: &str) -> Option<Vec<u8>> {
+    let charges = regex
+        .captures_iter(value)
+        .filter_map(|cap| cap[1].parse::<u8>().ok())
+        .filter(|&z| z > 0)
+        .collect::<Vec<_>>();
+    (!charges.is_empty()).then_some(charges)
 }
 
 pub struct DefaultParser;
@@ -167,13 +178,7 @@ impl DefaultParser {
         let regex_for_charge = &default_params.regex_for_charge;
 
         if let Some(charge_str) = line.strip_prefix("CHARGE=") {
-            let mut charge_array: Vec<u8> = Vec::new();
-            for cap in regex_for_charge.captures_iter(charge_str) {
-                if let Some(charge) = cap[0].chars().next().unwrap().to_digit(10) {
-                    charge_array.push(charge as u8);
-                }
-            }
-            default_params.charge_array = Some(charge_array);
+            default_params.charge_array = parse_charges(regex_for_charge, charge_str);
             return Ok(true);
         }
         Ok(false)
@@ -224,13 +229,7 @@ impl QueryParser {
         let regex_for_charge = &query_data.default_params.regex_for_charge;
 
         if let Some(charge_str) = line.strip_prefix("CHARGE=") {
-            let mut charge_array = Vec::new();
-            for cap in regex_for_charge.captures_iter(charge_str) {
-                if let Some(charge) = cap[0].chars().next().unwrap().to_digit(10) {
-                    charge_array.push(charge as u8);
-                }
-            }
-            query_data.precursor_charge_array = Some(charge_array);
+            query_data.precursor_charge_array = parse_charges(regex_for_charge, charge_str);
             return Ok(true);
         }
         Ok(false)
@@ -339,7 +338,11 @@ impl MgfReader {
 
         // embedded parameters
         while !default_params.is_query_start {
-            let line = lines.next().unwrap().trim();
+            let Some(line) = lines.next() else {
+                // no `BEGIN IONS` at all (e.g. an empty file)
+                return Ok(Vec::new());
+            };
+            let line = line.trim();
             for parser in &default_parsers {
                 match parser(line, &mut default_params) {
                     Ok(true) => break,
@@ -396,6 +399,30 @@ mod test {
 
     use super::{MgfError, MgfReader};
 
+    fn parse_one(charge_line: &str) -> Vec<RawSpectrum> {
+        let mgf = format!(
+            "BEGIN IONS\nTITLE=x\nPEPMASS=500.25\n{charge_line}\n100.1 5\n200.2 7\nEND IONS\n"
+        );
+        MgfReader::with_file_id(0).parse(mgf).unwrap()
+    }
+
+    #[test]
+    fn charges() {
+        assert_eq!(parse_one("CHARGE=10+")[0].precursors[0].charge, Some(10));
+        assert_eq!(parse_one("CHARGE=3")[0].precursors[0].charge, Some(3));
+        // empty or zero charge: unknown, not a dropped spectrum
+        assert_eq!(parse_one("CHARGE=")[0].precursors[0].charge, None);
+        assert_eq!(parse_one("CHARGE=0")[0].precursors[0].charge, None);
+    }
+
+    #[test]
+    fn empty_file() {
+        assert!(MgfReader::with_file_id(0)
+            .parse(String::new())
+            .unwrap()
+            .is_empty());
+    }
+
     fn make_ions_section_spectrum_0() -> String {
         let s = r#"
         BEGIN IONS
@@ -420,19 +447,13 @@ mod test {
         assert_eq!(s.id, "spectrum 0");
         assert_eq!(s.ms_level, 2);
         assert_eq!(s.representation, Representation::Centroid);
-        assert_eq!(s.precursors.len(), 2);
-        assert_eq!(s.precursors[0].charge, Some(2));
-        assert_eq!(s.precursors[1].charge, Some(3));
+        // "2+ and 3+": one precursor with unknown charge, so that both are searched
+        assert_eq!(s.precursors.len(), 1);
+        assert_eq!(s.precursors[0].charge, None);
         assert!((s.precursors[0].mz - 367.069682741984).abs() < 0.0001);
         assert_eq!(s.precursors[0].intensity, Some(56700.5185546875));
         assert_eq!(
             s.precursors[0].isolation_window,
-            Some(Tolerance::Ppm(-10.0, 10.0))
-        );
-        assert!((s.precursors[1].mz - 367.069682741984).abs() < 0.0001);
-        assert_eq!(s.precursors[1].intensity, Some(56700.5185546875));
-        assert_eq!(
-            s.precursors[1].isolation_window,
             Some(Tolerance::Ppm(-10.0, 10.0))
         );
         assert!((s.scan_start_time - 0.8963232289 / 60.0).abs() < 0.0001);
@@ -510,9 +531,9 @@ mod test {
         assert_eq!(spectra.len(), 2);
 
         let s = spectra.pop().unwrap();
-        assert_eq!(s.precursors.len(), 2);
-        assert_eq!(s.precursors[0].charge, Some(2));
-        assert_eq!(s.precursors[1].charge, Some(3));
+        // file-level "2+ and 3+": one precursor with unknown charge (both are searched)
+        assert_eq!(s.precursors.len(), 1);
+        assert_eq!(s.precursors[0].charge, None);
         assert_eq!(s.precursors[0].isolation_window, None);
         Ok(())
     }
