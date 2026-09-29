@@ -14,7 +14,7 @@ use sage_core::mass::Tolerance;
 use sage_core::peptide::Peptide;
 use sage_core::scoring::Fragments;
 use sage_core::scoring::{Feature, Scorer};
-use sage_core::spectrum::{ProcessedSpectrum, RawSpectrum, SpectrumProcessor};
+use sage_core::spectrum::{ProcessedSpectrum, SpectrumProcessor};
 use sage_core::tmt::TmtQuant;
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
@@ -29,59 +29,6 @@ pub struct Runner {
     pub database: IndexedDatabase,
     pub parameters: Search,
     start: Instant,
-}
-
-#[derive(Default)]
-struct RawSpectrumAccumulator {
-    pub ms1: Vec<RawSpectrum>,
-    pub msn: Vec<RawSpectrum>,
-}
-
-impl RawSpectrumAccumulator {
-    pub fn fold_op(mut self, rhs: RawSpectrum) -> Self {
-        if rhs.ms_level == 1 {
-            self.ms1.push(rhs);
-        } else {
-            self.msn.push(rhs);
-        }
-        self
-    }
-
-    pub fn reduce(mut self, other: Self) -> Self {
-        self.ms1.extend(other.ms1);
-        self.msn.extend(other.msn);
-        self
-    }
-}
-
-impl FromParallelIterator<RawSpectrum> for RawSpectrumAccumulator {
-    fn from_par_iter<I>(par_iter: I) -> Self
-    where
-        I: IntoParallelIterator<Item = RawSpectrum>,
-    {
-        par_iter
-            .into_par_iter()
-            .fold(
-                RawSpectrumAccumulator::default,
-                RawSpectrumAccumulator::fold_op,
-            )
-            .reduce(
-                RawSpectrumAccumulator::default,
-                RawSpectrumAccumulator::reduce,
-            )
-    }
-}
-
-impl FromIterator<RawSpectrum> for RawSpectrumAccumulator {
-    fn from_iter<I>(iter: I) -> Self
-    where
-        I: IntoIterator<Item = RawSpectrum>,
-    {
-        iter.into_iter().fold(
-            RawSpectrumAccumulator::default(),
-            RawSpectrumAccumulator::fold_op,
-        )
-    }
 }
 
 impl Runner {
@@ -438,40 +385,29 @@ impl Runner {
             }
         };
 
-        let spectra: RawSpectrumAccumulator = if file_serial_read {
-            chunk
-                .iter()
-                .enumerate()
-                .flat_map(inner_closure)
-                .flatten()
-                .collect()
-        } else {
-            chunk
-                .par_iter()
-                .enumerate()
-                .flat_map(inner_closure)
-                .flatten()
-                .collect()
+        // Process each file's spectra as soon as that file is read, so the raw
+        // (unfiltered) peak lists of only the files currently being read are alive,
+        // not those of the whole batch (by default num_cpus/2 files).
+        let read_and_process = |item| -> (Vec<ProcessedSpectrum>, Vec<ProcessedSpectrum>) {
+            let Ok(raw) = inner_closure(item) else {
+                return Default::default();
+            };
+            let (ms1, msn): (Vec<_>, Vec<_>) = raw.into_par_iter().partition(|s| s.ms_level == 1);
+            (
+                ms1.into_par_iter().map(|s| sp.process(s)).collect(),
+                msn.into_par_iter().map(|s| sp.process(s)).collect(),
+            )
         };
-
-        let msn_spectra = spectra
-            .msn
-            .into_par_iter()
-            .map(|s| sp.process(s))
-            .collect::<Vec<_>>();
-
-        let has_ims = spectra.ms1.iter().any(|x| x.mobility.is_some());
-        let ms1_spectra = if spectra.ms1.is_empty() {
-            log::trace!("no MS1 spectra found");
-            Vec::new()
+        let per_file: Vec<_> = if file_serial_read {
+            chunk.iter().enumerate().map(read_and_process).collect()
         } else {
-            if has_ims {
-                log::trace!("Processing MS1 spectra with IMS columns");
-            } else {
-                log::trace!("Processing MS1 spectra without IMS");
-            }
-            spectra.ms1.into_par_iter().map(|s| sp.process(s)).collect()
+            chunk.par_iter().enumerate().map(read_and_process).collect()
         };
+        let (mut ms1_spectra, mut msn_spectra) = (Vec::new(), Vec::new());
+        for (ms1, msn) in per_file {
+            ms1_spectra.extend(ms1);
+            msn_spectra.extend(msn);
+        }
 
         let io_time = Instant::now() - start;
         info!("- file IO: {:8} ms", io_time.as_millis());
