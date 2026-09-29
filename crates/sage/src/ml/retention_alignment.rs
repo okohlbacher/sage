@@ -68,6 +68,11 @@ fn rt_matrix(features: &[Feature], max_rt: &[f64]) -> (HashMap<PeptideIx, f64>, 
             let mut sum = 0.0;
             let mut len = 0.0;
             for (&file_id, &rt) in entry.value() {
+                // a file without retention times (max 0) is missing, not 0/0 = NaN, which
+                // dropped the whole peptide from the alignment of the other files
+                if max_rt[file_id] <= 0.0 {
+                    continue;
+                }
                 let rt = rt / max_rt[file_id];
                 v[file_id] = rt;
                 sum += rt;
@@ -204,5 +209,36 @@ mod test {
             .collect::<Vec<_>>();
         global_alignment(&mut features, 2);
         assert!(features.iter().all(|f| f.aligned_rt.is_finite()));
+    }
+
+    #[test]
+    fn rt_less_file_does_not_change_other_alignments() {
+        // file 0 and file 1 have RTs (file 1 shifted), file 2 has none
+        let make = |files: usize| {
+            (0..60)
+                .filter_map(|i| {
+                    let file = i % 3;
+                    (file < files).then(|| Feature {
+                        peptide_idx: PeptideIx((i / 3) as u32),
+                        file_id: file,
+                        rt: match file {
+                            0 => 10.0 + (i / 3) as f32,
+                            1 => 12.0 + 1.1 * (i / 3) as f32,
+                            _ => 0.0,
+                        },
+                        label: 1,
+                        spectrum_q: 0.0,
+                        ..Default::default()
+                    })
+                })
+                .collect::<Vec<_>>()
+        };
+        let (mut two, mut three) = (make(2), make(3));
+        let a2 = global_alignment(&mut two, 2);
+        let a3 = global_alignment(&mut three, 3);
+        for f in 0..2 {
+            assert!((a2[f].slope - a3[f].slope).abs() < 1e-6, "file {f}");
+            assert!((a2[f].intercept - a3[f].intercept).abs() < 1e-6, "file {f}");
+        }
     }
 }

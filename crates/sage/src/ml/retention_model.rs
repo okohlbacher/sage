@@ -21,6 +21,21 @@ pub fn predict(db: &IndexedDatabase, features: &mut [Feature]) -> Option<()> {
         feat.predicted_rt = bounded;
         feat.delta_rt_model = (feat.aligned_rt - bounded).abs();
     });
+    // PSMs without a measured RT (e.g. MGF without RTINSECONDS) have no residual; give
+    // them the median residual of the others, so the feature is neutral for them
+    let mut deltas = features
+        .iter()
+        .filter(|f| f.rt > 0.0)
+        .map(|f| f.delta_rt_model)
+        .collect::<Vec<_>>();
+    if deltas.len() < features.len() && !deltas.is_empty() {
+        let mid = deltas.len() / 2;
+        let median = *deltas.select_nth_unstable_by(mid, f32::total_cmp).1;
+        features
+            .par_iter_mut()
+            .filter(|f| f.rt <= 0.0)
+            .for_each(|f| f.delta_rt_model = median);
+    }
     Some(())
 }
 pub struct RetentionModel {
@@ -68,7 +83,8 @@ impl RetentionModel {
 
         let lr = LinearRegression::fit::<_, FEATURES>(
             training_set,
-            |feat| feat.label == 1 && feat.spectrum_q <= 0.01,
+            // PSMs without a measured RT would train the model on RT = 0
+            |feat| feat.label == 1 && feat.spectrum_q <= 0.01 && feat.rt > 0.0,
             |psm| Self::embed(&db[psm.peptide_idx], &map),
             |psm| psm.aligned_rt as f64,
         )?;
