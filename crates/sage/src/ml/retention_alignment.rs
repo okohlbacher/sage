@@ -149,9 +149,22 @@ pub fn global_alignment(features: &mut [Feature], n_files: usize) -> Vec<Alignme
                 b = intercept
             );
 
+            // Without retention times (e.g. MGF without RTINSECONDS) the maximum is 0 and
+            // rt / max_rt = NaN, which made the LDA fail and fall back to the heuristic
+            // score for *every* file of the run. Use a constant 0 feature instead.
+            let file_max_rt = if max_rt[file_id] > 0.0 {
+                max_rt[file_id]
+            } else {
+                log::warn!(
+                    "file #{} has no retention times; RT-based features are not informative for it",
+                    file_id
+                );
+                1.0
+            };
+
             Alignment {
                 file_id,
-                max_rt: max_rt[file_id] as f32,
+                max_rt: file_max_rt as f32,
                 slope: slope as f32,
                 intercept: intercept as f32,
             }
@@ -170,4 +183,26 @@ pub fn global_alignment(features: &mut [Feature], n_files: usize) -> Vec<Alignme
     });
 
     alignments
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn files_without_retention_times_do_not_produce_nan() {
+        let mut features = (0..40)
+            .map(|i| Feature {
+                peptide_idx: PeptideIx(i % 10),
+                file_id: (i % 2) as usize,
+                // file 1 has no retention times
+                rt: if i % 2 == 0 { 10.0 + i as f32 } else { 0.0 },
+                label: 1,
+                spectrum_q: 0.0,
+                ..Default::default()
+            })
+            .collect::<Vec<_>>();
+        global_alignment(&mut features, 2);
+        assert!(features.iter().all(|f| f.aligned_rt.is_finite()));
+    }
 }
