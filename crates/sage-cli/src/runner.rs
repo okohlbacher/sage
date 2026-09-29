@@ -223,7 +223,7 @@ impl Runner {
 
         spectra
             .par_iter()
-            .filter(|spec| spec.masses.len() >= self.parameters.min_peaks && spec.level == 2)
+            .filter(|spec| self.searchable(spec))
             .for_each(|spectrum| {
                 let prev = counter.fetch_add(1, Ordering::Relaxed);
                 if prev > 0 && prev % 10_000 == 0 {
@@ -282,7 +282,7 @@ impl Runner {
 
         let features: Vec<_> = msn_spectra
             .par_iter()
-            .filter(|spec| spec.masses.len() >= self.parameters.min_peaks && spec.level == 2)
+            .filter(|spec| self.searchable(spec))
             .map(|x| {
                 let prev = counter.fetch_add(1, Ordering::Relaxed);
                 if prev > 0 && prev % 10_000 == 0 {
@@ -337,6 +337,13 @@ impl Runner {
     fn process_chunk(&self, scorer: &Scorer, spectra: Spectra) -> SageResults {
         let features = self.search_processed_spectra(scorer, &spectra.1);
         self.complete_features(spectra.1, spectra.0, features)
+    }
+
+    /// MS2 spectra with enough peaks and a precursor to search against
+    fn searchable(&self, spec: &ProcessedSpectrum) -> bool {
+        spec.level == 2
+            && spec.masses.len() >= self.parameters.min_peaks
+            && !spec.precursors.is_empty()
     }
 
     fn read_processed_spectra(
@@ -426,6 +433,17 @@ impl Runner {
         for (ms1, msn) in per_file {
             ms1_spectra.extend(ms1);
             msn_spectra.extend(msn);
+        }
+
+        let no_precursor = msn_spectra
+            .iter()
+            .filter(|s| s.level == 2 && s.precursors.is_empty())
+            .count();
+        if no_precursor > 0 {
+            log::warn!(
+                "{} MS2 spectra have no usable precursor m/z and are not searched",
+                no_precursor
+            );
         }
 
         let io_time = Instant::now() - start;

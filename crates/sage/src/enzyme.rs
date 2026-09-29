@@ -33,6 +33,10 @@ pub struct DigestGroup {
 
 pub fn group_digests(mut digests: Vec<Digest>) -> Vec<DigestGroup> {
     let mut groups = Vec::new();
+    if digests.is_empty() {
+        // e.g. a FASTA (chunk) whose proteins yield no peptide in the length range
+        return groups;
+    }
     // Grouping only needs (position, decoy, sequence); the remaining keys make the
     // order total, so the group's reference digest (and its semi-enzymatic /
     // missed-cleavage flags) no longer depends on input order. Parallel: this sort
@@ -206,7 +210,11 @@ impl Enzyme {
             if sequence
                 .as_bytes()
                 .get(right)
-                .map_or(false, |b| self.skip_suffix[(b - b'A') as usize])
+                // bytes outside A-Z (e.g. `*` stop codons) never restrict cleavage
+                .and_then(|b| b.checked_sub(b'A'))
+                .and_then(|i| self.skip_suffix.get(i as usize))
+                .copied()
+                .unwrap_or(false)
             {
                 continue;
             }
@@ -355,6 +363,20 @@ impl EnzymeParameters {
 mod test {
     use quickcheck_macros::quickcheck;
     use std::collections::HashSet;
+
+    #[test]
+    fn non_letters_after_cleavage_site_do_not_panic() {
+        let trypsin = Enzyme::new("KR", "P", true, false).unwrap();
+        for seq in [
+            "PEPTIDEK*",
+            "PEPTIDEKpeptide",
+            "PEPTIDEK1DE",
+            "PEPTIDEK\u{00e9}",
+        ] {
+            let _ = trypsin.cleavage_sites(seq);
+        }
+        assert!(group_digests(Vec::new()).is_empty());
+    }
 
     #[test]
     fn group_digests_independent_of_input_order() {

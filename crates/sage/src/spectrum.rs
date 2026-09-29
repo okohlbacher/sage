@@ -57,6 +57,16 @@ pub struct ProcessedSpectrum {
     pub total_ion_current: f32,
 }
 
+static PROFILE_WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static LENGTH_WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Log a warning the first time a class of bad input is seen
+fn warn_once(flag: &std::sync::atomic::AtomicBool, message: impl FnOnce() -> String) {
+    if !flag.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        log::warn!("{}", message());
+    }
+}
+
 #[derive(Default, Debug, Clone)]
 /// An unprocessed mass spectrum, as returned by a parser
 /// *CRITICAL*: Users must set all fields manually, including `file_id`
@@ -357,11 +367,16 @@ impl SpectrumProcessor {
         spectrum: &RawSpectrum,
     ) -> (Vec<f32>, Vec<f32>, Vec<u8>) {
         if spectrum.representation != Representation::Centroid {
-            // Panic, because there's really nothing we can do with profile data
-            panic!(
-                "Scan {} contains profile data! Please convert to centroid",
-                spectrum.id
-            );
+            // Nothing sensible can be done with profile data. Skip the spectrum (it has no
+            // peaks afterwards) instead of aborting the whole run.
+            warn_once(&PROFILE_WARNED, || {
+                format!(
+                    "scan {} contains profile data and is skipped; please convert to centroid \
+                     (further profile scans are skipped silently)",
+                    spectrum.id
+                )
+            });
+            return Default::default();
         }
 
         // If there is no precursor charge from the mzML file, then deisotope fragments up to z=3
@@ -418,10 +433,24 @@ impl SpectrumProcessor {
         }
     }
 
-    pub fn process(&self, spectrum: RawSpectrum) -> ProcessedSpectrum {
-        debug_assert_eq!(spectrum.mz.len(), spectrum.intensity.len());
-        if let Some(mobilities) = spectrum.mobility.as_ref() {
-            debug_assert_eq!(spectrum.mz.len(), mobilities.len());
+    pub fn process(&self, mut spectrum: RawSpectrum) -> ProcessedSpectrum {
+        // Mismatched array lengths would index out of bounds below (deisotoping walks
+        // `mz` and reads `intensity` at the same index). Skip such a spectrum.
+        let mobility_mismatch = spectrum
+            .mobility
+            .as_ref()
+            .is_some_and(|m| m.len() != spectrum.mz.len());
+        if spectrum.mz.len() != spectrum.intensity.len() || mobility_mismatch {
+            warn_once(&LENGTH_WARNED, || {
+                format!(
+                    "scan {} has m/z, intensity and mobility arrays of different lengths \
+                     and is skipped (further such scans are skipped silently)",
+                    spectrum.id
+                )
+            });
+            spectrum.mz.clear();
+            spectrum.intensity.clear();
+            spectrum.mobility = None;
         }
 
         let (masses, intensities, charges, mobilities) =
@@ -474,6 +503,36 @@ impl SpectrumProcessor {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    fn ms2(representation: Representation, mz: Vec<f32>, intensity: Vec<f32>) -> RawSpectrum {
+        RawSpectrum {
+            ms_level: 2,
+            representation,
+            precursors: vec![Precursor {
+                mz: 500.0,
+                charge: Some(2),
+                ..Default::default()
+            }],
+            mz,
+            intensity,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn bad_spectra_are_skipped_not_fatal() {
+        let sp = SpectrumProcessor::new(150, true, 0.0);
+        let peaks = vec![100.0, 200.0, 300.0];
+        let ok = sp.process(ms2(Representation::Centroid, peaks.clone(), vec![1.0; 3]));
+        assert_eq!(ok.masses.len(), 3);
+
+        let profile = sp.process(ms2(Representation::Profile, peaks.clone(), vec![1.0; 3]));
+        assert!(profile.masses.is_empty());
+
+        // intensity array shorter than m/z: used to index out of bounds in deisotoping
+        let short = sp.process(ms2(Representation::Centroid, peaks, vec![1.0; 2]));
+        assert!(short.masses.is_empty());
+    }
 
     #[test]
     fn test_deisotope() {

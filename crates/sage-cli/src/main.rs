@@ -118,7 +118,8 @@ fn main() -> anyhow::Result<()> {
     let parallel = matches
         .get_one::<u16>("batch-size")
         .copied()
-        .unwrap_or_else(|| num_cpus::get() as u16 / 2) as usize;
+        .unwrap_or_else(|| num_cpus::get() as u16 / 2)
+        .max(1) as usize; // num_cpus/2 is 0 on a single-CPU machine
 
     let parquet = matches.get_one::<bool>("parquet").copied().unwrap_or(false);
     let send_telemetry = matches

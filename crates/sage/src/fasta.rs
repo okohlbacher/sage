@@ -11,6 +11,26 @@ pub struct Fasta {
     generate_decoys: bool,
 }
 
+/// First word of a header line (an empty header gives an empty accession, not a panic)
+fn accession(header: &str) -> String {
+    header
+        .split_ascii_whitespace()
+        .next()
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// Upper-case residues (lower case is used for soft masking) and drop a terminal stop
+/// codon (`*`, e.g. translated/Ensembl FASTAs). Anything else that is not a residue
+/// makes the peptides containing it invalid; they are dropped when digested.
+fn clean(sequence: String) -> String {
+    let mut sequence = sequence.to_ascii_uppercase();
+    while sequence.ends_with('*') {
+        sequence.pop();
+    }
+    sequence
+}
+
 impl Fasta {
     // Parse a string into a fasta database
     pub fn parse<S: Into<String>>(contents: String, decoy_tag: S, generate_decoys: bool) -> Fasta {
@@ -27,9 +47,8 @@ impl Fasta {
             let line = line.trim();
             if let Some(id) = line.strip_prefix('>') {
                 if !s.is_empty() {
-                    let acc: Arc<str> =
-                        Arc::from(last_id.split_ascii_whitespace().next().unwrap().to_string());
-                    let seq = std::mem::take(&mut s);
+                    let acc: Arc<str> = Arc::from(accession(last_id));
+                    let seq = clean(std::mem::take(&mut s));
                     if !acc.contains(&decoy_tag) || !generate_decoys {
                         targets.push((acc, seq));
                     }
@@ -41,10 +60,9 @@ impl Fasta {
         }
 
         if !s.is_empty() {
-            let acc: Arc<str> =
-                Arc::from(last_id.split_ascii_whitespace().next().unwrap().to_string());
+            let acc: Arc<str> = Arc::from(accession(last_id));
             if !acc.contains(&decoy_tag) || !generate_decoys {
-                targets.push((acc, s));
+                targets.push((acc, clean(s)));
             }
         }
 
@@ -86,5 +104,24 @@ impl Fasta {
                 decoy_tag: self.decoy_tag.clone(),
                 generate_decoys: self.generate_decoys,
             })
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn sequences_are_cleaned() {
+        let fasta = Fasta::parse(
+            ">sp|P1|A desc\npeptidek\nAAK*\n>\nMKR\n".into(),
+            "rev_",
+            false,
+        );
+        assert_eq!(fasta.targets[0].0.as_ref(), "sp|P1|A");
+        assert_eq!(fasta.targets[0].1, "PEPTIDEKAAK");
+        // an empty header does not panic
+        assert_eq!(fasta.targets[1].0.as_ref(), "");
+        assert_eq!(fasta.targets[1].1, "MKR");
     }
 }
