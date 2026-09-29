@@ -454,16 +454,8 @@ impl<'db> Scorer<'db> {
                     fragment_hi,
                 );
                 for page in page_lo..page_hi {
-                    let start = page * db.bucket_size;
-                    let end = ((page + 1) * db.bucket_size).min(db.fragments.len());
-                    let slice = &db.fragments[start..end];
-                    let (inner_lo, inner_hi) = binary_search_slice(
-                        slice,
-                        |frag, bounds| (frag.peptide_index.0 as usize).cmp(bounds),
-                        union_lo,
-                        union_hi,
-                    );
-                    for frag in &slice[inner_lo..inner_hi] {
+                    let (inner_lo, inner_hi) = db.page_range(page, union_lo, union_hi);
+                    for frag in &db.fragments[inner_lo..inner_hi] {
                         if frag.fragment_mz < fragment_lo || frag.fragment_mz > fragment_hi {
                             continue;
                         }

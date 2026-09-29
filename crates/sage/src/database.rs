@@ -450,10 +450,13 @@ impl Parameters {
             })
             .collect::<Vec<(ModificationSpecificity, f32)>>();
 
+        let page_skip = page_skip(&fragments, self.bucket_size);
+
         IndexedDatabase {
             peptides: target_decoys,
             fragments,
             min_value,
+            page_skip,
             bucket_size: self.bucket_size,
             ion_kinds: self.ion_kinds,
             generate_decoys: self.generate_decoys,
@@ -493,6 +496,24 @@ fn advise_huge_pages<T>(buf: &mut [T]) {
     let _ = buf;
 }
 
+/// Stride of the per-page skip table
+const SKIP: usize = 64;
+
+/// Peptide index of every `SKIP`-th fragment of each page, `bucket_size / SKIP` entries
+/// per page (padded with `u32::MAX` for the last, shorter page)
+fn page_skip(fragments: &[Theoretical], bucket_size: usize) -> Vec<u32> {
+    let per_page = bucket_size.div_ceil(SKIP);
+    fragments
+        .par_chunks(bucket_size)
+        .flat_map_iter(|page| {
+            (0..per_page).map(move |k| {
+                page.get(k * SKIP)
+                    .map_or(u32::MAX, |frag| frag.peptide_index.0)
+            })
+        })
+        .collect()
+}
+
 #[derive(Hash, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize)]
 #[repr(transparent)]
 pub struct PeptideIx(pub u32);
@@ -516,6 +537,8 @@ pub struct IndexedDatabase {
     pub fragments: Vec<Theoretical>,
     pub ion_kinds: Vec<Kind>,
     pub min_value: Vec<f32>,
+    /// Peptide index of every `SKIP`-th fragment of each page (see [`page_skip`])
+    pub page_skip: Vec<u32>,
     /// Keep a list of potential (AA, mass) modifications for RT prediction
     pub potential_mods: Vec<(ModificationSpecificity, f32)>,
     pub bucket_size: usize,
@@ -524,6 +547,42 @@ pub struct IndexedDatabase {
 }
 
 impl IndexedDatabase {
+    /// Absolute fragment indices `[start, end)` within `page` that cover every fragment
+    /// whose peptide index lies in `lo..=hi` (plus at most one fragment below `lo`, as
+    /// with [`binary_search_slice`]; callers filter exact bounds anyway).
+    ///
+    /// Pages are sorted by peptide index. A plain binary search over an 8192-entry page
+    /// costs ~13 dependent probes spread over 64 KB, nearly all cache and TLB misses; this
+    /// is the dominant cost of the search. The skip table (4 bytes per `SKIP` fragments,
+    /// ~18 MB for human tryptic) first narrows the search to a few `SKIP`-sized blocks.
+    pub fn page_range(&self, page: usize, lo: usize, hi: usize) -> (usize, usize) {
+        let start = page * self.bucket_size;
+        let end = ((page + 1) * self.bucket_size).min(self.fragments.len());
+        let per_page = self.bucket_size.div_ceil(SKIP);
+        let (s, e) = match self.page_skip.get(page * per_page..(page + 1) * per_page) {
+            Some(skip) => {
+                // blocks before `first` hold only indices < lo; blocks from `last` on hold
+                // only indices > hi
+                let first = skip
+                    .partition_point(|&v| (v as usize) < lo)
+                    .saturating_sub(1);
+                let last = skip.partition_point(|&v| (v as usize) <= hi);
+                (
+                    (start + first * SKIP).min(end),
+                    (start + last * SKIP).min(end),
+                )
+            }
+            None => (start, end),
+        };
+        let (l, r) = binary_search_slice(
+            &self.fragments[s..e],
+            |frag, bound| (frag.peptide_index.0 as usize).cmp(bound),
+            lo,
+            hi,
+        );
+        (s + l, s + r)
+    }
+
     /// Create a new [`IndexedQuery`] for a specific [`ProcessedSpectrum`]
     ///
     /// All matches returned by the query will be within the specified tolerance
@@ -628,16 +687,12 @@ impl IndexedQuery<'_> {
             // accidentally go out of bounds!
             let right_idx = ((page + 1) * self.db.bucket_size).min(self.db.fragments.len());
 
-            // Narrow down into our region of interest, then perform another binary
-            // search to further refine down to the slice of matching precursor mzs
+            // Narrow down into our region of interest: the slice of matching precursor mzs
             let slice = &&self.db.fragments[left_idx..right_idx];
-
-            let (inner_left, inner_right) = binary_search_slice(
-                slice,
-                |frag, bounds| (frag.peptide_index.0 as usize).cmp(bounds),
-                self.pre_idx_lo,
-                self.pre_idx_hi,
-            );
+            let (inner_left, inner_right) = {
+                let (l, r) = self.db.page_range(page, self.pre_idx_lo, self.pre_idx_hi);
+                (l - left_idx, r - left_idx)
+            };
 
             // Finally, filter down our slice into exact matches only
             slice[inner_left..inner_right].iter().filter(move |frag| {
@@ -779,6 +834,53 @@ mod test {
         assert_eq!(peptides.len(), 1);
         assert!(!peptides[0].decoy);
         assert_eq!(peptides[0].proteins, vec![Arc::from("P1")]);
+    }
+
+    #[test]
+    fn page_range_covers_the_same_fragments_as_a_full_page_search() {
+        for bucket_size in [32, 64, 128, 1000, 8192] {
+            let mut builder = Builder {
+                bucket_size: Some(bucket_size),
+                enzyme: Some(EnzymeBuilder {
+                    missed_cleavages: Some(2),
+                    min_len: Some(5),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            builder.update_fasta("unused".into());
+            let fasta = Fasta::parse(
+                include_str!("../../../tests/Q99536.fasta").into(),
+                "rev_",
+                true,
+            );
+            let db = builder.make_parameters().build(fasta);
+            let n = db.peptides.len();
+            let pages = db.fragments.len().div_ceil(db.bucket_size);
+            for lo in (0..n).step_by(7) {
+                for hi in [lo, lo + 1, lo + 5, lo + 40, n + 3] {
+                    for page in 0..pages {
+                        let start = page * db.bucket_size;
+                        let end = (start + db.bucket_size).min(db.fragments.len());
+                        let page_frags = &db.fragments[start..end];
+                        let expected = page_frags
+                            .iter()
+                            .filter(|f| (lo..=hi).contains(&(f.peptide_index.0 as usize)))
+                            .count();
+                        let (l, r) = db.page_range(page, lo, hi);
+                        assert!(start <= l && l <= r && r <= end);
+                        let got = db.fragments[l..r]
+                            .iter()
+                            .filter(|f| (lo..=hi).contains(&(f.peptide_index.0 as usize)))
+                            .count();
+                        assert_eq!(
+                            got, expected,
+                            "bucket {bucket_size} page {page} {lo}..={hi}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]
