@@ -35,15 +35,16 @@ impl<'a> Kde<'a> {
         (-0.5 * x.powi(2)).exp()
     }
 
+    /// Density at `x`. Serial on purpose: [`Builder::build`] parallelises over the
+    /// evaluation points instead, which avoids one fork/join per point and makes the
+    /// result independent of the thread count.
     pub fn pdf(&self, x: f64) -> f64 {
         let h = self.bandwidth;
-
         let sum = self
             .sample
-            .par_iter()
-            .fold(|| 0.0, |acc, xi| acc + self.kernel((x - xi) / h))
+            .iter()
+            .map(|xi| self.kernel((x - xi) / h))
             .sum::<f64>();
-
         sum / self.constant
     }
 }
@@ -111,6 +112,7 @@ impl Builder {
 
         // Calculate PEP for 1000 evenly spaced scores
         let mut bins = (0..self.bins)
+            .into_par_iter()
             .map(|bin| {
                 let score = (bin as f64 * score_step) + min_score;
                 let decoy = decoy.pdf(score) * pi;
@@ -165,5 +167,37 @@ impl Estimator {
         // Linear interpolation between lower and upper bin
         let delta = upper - lower;
         lower + (delta * linear)
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn pep_is_deterministic_across_thread_counts() {
+        // decoys ~ N(0, 1), targets a mixture of N(0, 1) and N(4, 1)
+        let normal = |i: usize| ((i as f64 * 0.618_033_988_75).fract() - 0.5) * 3.4;
+        let mut scores = Vec::new();
+        let mut decoys = Vec::new();
+        for i in 0..20_000 {
+            scores.push(normal(i));
+            decoys.push(i % 2 == 0);
+            if i % 3 == 0 {
+                scores.push(4.0 + normal(i + 7));
+                decoys.push(false);
+            }
+        }
+        let fit = |threads| {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap()
+                .install(|| Builder::default().build(&scores, &decoys))
+        };
+        let (one, many) = (fit(1), fit(8));
+        assert_eq!(one.bins, many.bins);
+        assert!(one.posterior_error(-1.0) > 0.4);
+        assert!(one.posterior_error(5.0) < 0.01);
     }
 }
