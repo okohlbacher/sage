@@ -334,6 +334,7 @@ impl Parameters {
         let total: usize = totals.iter().sum();
 
         let mut fragments: Vec<Theoretical> = Vec::with_capacity(total);
+        advise_huge_pages(fragments.spare_capacity_mut());
         let mut rest = &mut fragments.spare_capacity_mut()[..total];
         let mut blocks = Vec::with_capacity(totals.len());
         for &n in &totals {
@@ -441,6 +442,36 @@ impl Parameters {
             decoy_tag: self.decoy_tag,
         }
     }
+}
+
+/// Ask the kernel to back `buf` with transparent huge pages before it is touched.
+///
+/// The fragment index is a multi-GB array searched with random, cache-missing binary
+/// searches; with 4 KiB pages nearly every probe also misses the TLB. Most
+/// distributions ship THP in `madvise` mode, so without this hint the index stays on
+/// small pages. PXD041421: index build -20%, search -2..-9% (same effect as
+/// `GLIBC_TUNABLES=glibc.malloc.hugetlb=1`). A no-op elsewhere or if THP is disabled.
+fn advise_huge_pages<T>(buf: &mut [T]) {
+    #[cfg(target_os = "linux")]
+    {
+        const PAGE: usize = 4096;
+        let start = buf.as_mut_ptr() as usize;
+        let end = start + std::mem::size_of_val(buf);
+        let aligned = (start + PAGE - 1) & !(PAGE - 1);
+        if end > aligned {
+            // SAFETY: the range lies inside `buf`'s allocation; MADV_HUGEPAGE only
+            // changes how the kernel backs these pages, never their contents.
+            unsafe {
+                libc::madvise(
+                    aligned as *mut libc::c_void,
+                    end - aligned,
+                    libc::MADV_HUGEPAGE,
+                );
+            }
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = buf;
 }
 
 #[derive(Hash, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize)]
