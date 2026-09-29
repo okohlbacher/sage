@@ -1,4 +1,4 @@
-use crate::database::{IndexedDatabase, PeptideIx};
+use crate::database::{binary_search_slice, IndexedDatabase, PeptideIx};
 use crate::heap::bounded_min_heapify;
 use crate::ion_series::{IonSeries, Kind};
 use crate::mass::{Tolerance, NEUTRON, PROTON};
@@ -382,6 +382,120 @@ impl<'db> Scorer<'db> {
         hits
     }
 
+    /// Preliminary scoring for all isotope errors at once.
+    ///
+    /// Gives the same result as calling [`Self::matched_peaks_with_isotope`] for each
+    /// isotope error and concatenating, but binary-searches each fragment page once for
+    /// the union of the isotope windows instead of once per window. Within a page,
+    /// fragments are sorted by peptide index (i.e. precursor mass) and the windows are
+    /// ~1 Da apart, so their sub-ranges are a few entries from each other: one search
+    /// plus a short scan replaces one cache-missing binary search per window. This is
+    /// the dominant cost of preliminary scoring.
+    fn matched_peaks_isotope_windows(
+        &self,
+        query: &ProcessedSpectrum,
+        precursor_mass: f32,
+        precursor_charge: u8,
+        precursor_tol: Tolerance,
+    ) -> InitialHits {
+        struct Window {
+            isotope: i8,
+            idx_lo: usize,
+            idx_hi: usize,
+            mass_lo: f32,
+            mass_hi: f32,
+            hits: InitialHits,
+        }
+
+        let db = self.db;
+        let mut windows = (self.min_isotope_err..=self.max_isotope_err)
+            .map(|isotope| {
+                let mass = precursor_mass - isotope as f32 * NEUTRON;
+                let query = db.query(mass, precursor_tol, self.fragment_tol);
+                let (mass_lo, mass_hi) = precursor_tol.bounds(mass);
+                Window {
+                    isotope,
+                    idx_lo: query.pre_idx_lo,
+                    idx_hi: query.pre_idx_hi,
+                    mass_lo,
+                    mass_hi,
+                    hits: InitialHits {
+                        matched_peaks: 0,
+                        scored_candidates: 0,
+                        preliminary: vec![
+                            PreScore::default();
+                            query.pre_idx_hi - query.pre_idx_lo + 1
+                        ],
+                    },
+                }
+            })
+            .collect::<Vec<_>>();
+        let union_lo = windows.iter().map(|w| w.idx_lo).min().unwrap_or_default();
+        let union_hi = windows.iter().map(|w| w.idx_hi).max().unwrap_or_default();
+
+        let max_fragment_charge = max_fragment_charge(self.max_fragment_charge, precursor_charge);
+        for peak_mass in query.masses.iter() {
+            for charge in 1..max_fragment_charge {
+                let (fragment_lo, fragment_hi) =
+                    self.fragment_tol.bounds(peak_mass * charge as f32);
+                let (page_lo, page_hi) = binary_search_slice(
+                    &db.min_value,
+                    |min, bounds| min.total_cmp(bounds),
+                    fragment_lo,
+                    fragment_hi,
+                );
+                for page in page_lo..page_hi {
+                    let start = page * db.bucket_size;
+                    let end = ((page + 1) * db.bucket_size).min(db.fragments.len());
+                    let slice = &db.fragments[start..end];
+                    let (inner_lo, inner_hi) = binary_search_slice(
+                        slice,
+                        |frag, bounds| (frag.peptide_index.0 as usize).cmp(bounds),
+                        union_lo,
+                        union_hi,
+                    );
+                    for frag in &slice[inner_lo..inner_hi] {
+                        if frag.fragment_mz < fragment_lo || frag.fragment_mz > fragment_hi {
+                            continue;
+                        }
+                        let ix = frag.peptide_index.0 as usize;
+                        // windows may overlap (wide Da tolerances): check each of them
+                        for w in windows.iter_mut() {
+                            // same edge handling as `IndexedQuery::page_search`
+                            let inside = (ix > w.idx_lo
+                                || (ix == w.idx_lo && db.peptides[ix].monoisotopic >= w.mass_lo))
+                                && (ix < w.idx_hi
+                                    || (ix == w.idx_hi
+                                        && db.peptides[ix].monoisotopic <= w.mass_hi));
+                            if !inside {
+                                continue;
+                            }
+                            let sc = &mut w.hits.preliminary[ix - w.idx_lo];
+                            if sc.matched == 0 {
+                                w.hits.scored_candidates += 1;
+                                sc.precursor_charge = precursor_charge;
+                                sc.peptide = frag.peptide_index;
+                                sc.isotope_error = w.isotope;
+                            }
+                            sc.matched += 1;
+                            w.hits.matched_peaks += 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        windows
+            .into_iter()
+            .fold(InitialHits::default(), |mut acc, mut w| {
+                if w.hits.matched_peaks > 0 {
+                    self.trim_hits(&mut w.hits);
+                }
+                acc += w.hits;
+                acc
+            })
+    }
+
     fn matched_peaks(
         &self,
         query: &ProcessedSpectrum,
@@ -390,18 +504,11 @@ impl<'db> Scorer<'db> {
         precursor_tol: Tolerance,
     ) -> InitialHits {
         if self.min_isotope_err != self.max_isotope_err {
-            let mut hits = (self.min_isotope_err..=self.max_isotope_err).fold(
-                InitialHits::default(),
-                |mut hits, isotope| {
-                    hits += self.matched_peaks_with_isotope(
-                        query,
-                        precursor_mass,
-                        precursor_charge,
-                        precursor_tol,
-                        isotope,
-                    );
-                    hits
-                },
+            let mut hits = self.matched_peaks_isotope_windows(
+                query,
+                precursor_mass,
+                precursor_charge,
+                precursor_tol,
             );
             self.trim_hits(&mut hits);
             hits
@@ -808,6 +915,121 @@ impl Run {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::database::{Builder, EnzymeBuilder};
+    use crate::spectrum::{RawSpectrum, Representation, SpectrumProcessor};
+
+    /// The old preliminary search: one fragment-index search per isotope window
+    fn per_window_reference(
+        scorer: &Scorer,
+        query: &ProcessedSpectrum,
+        mass: f32,
+        charge: u8,
+        tol: Tolerance,
+    ) -> InitialHits {
+        let mut hits = (scorer.min_isotope_err..=scorer.max_isotope_err).fold(
+            InitialHits::default(),
+            |mut hits, isotope| {
+                hits += scorer.matched_peaks_with_isotope(query, mass, charge, tol, isotope);
+                hits
+            },
+        );
+        scorer.trim_hits(&mut hits);
+        hits
+    }
+
+    #[test]
+    fn isotope_windows_match_per_window_search() {
+        let fasta = crate::fasta::Fasta::parse(
+            include_str!("../../../tests/Q99536.fasta").into(),
+            "rev_",
+            true,
+        );
+        let mut builder = Builder {
+            // many small pages, so that page boundaries are exercised
+            bucket_size: Some(64),
+            enzyme: Some(EnzymeBuilder {
+                missed_cleavages: Some(2),
+                min_len: Some(5),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        builder.update_fasta("unused".into());
+        let db = builder.make_parameters().build(fasta);
+        assert!(db.min_value.len() > 20, "test needs several pages");
+
+        // Spectrum: singly charged b/y ions of three target peptides, precursor taken
+        // from the first one, shifted by +1 isotope so that a non-zero window matches
+        let targets = db
+            .peptides
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| !p.decoy)
+            .map(|(ix, _)| ix as u32)
+            .step_by(7)
+            .take(3)
+            .collect::<Vec<_>>();
+        let mut mz = db
+            .fragments
+            .iter()
+            .filter(|f| targets.contains(&f.peptide_index.0))
+            .map(|f| f.fragment_mz + PROTON)
+            .collect::<Vec<_>>();
+        mz.sort_by(f32::total_cmp);
+        let precursor_mass = db.peptides[targets[0] as usize].monoisotopic + NEUTRON;
+        let raw = RawSpectrum {
+            ms_level: 2,
+            representation: Representation::Centroid,
+            precursors: vec![Precursor {
+                mz: precursor_mass / 2.0 + PROTON,
+                charge: Some(2),
+                ..Default::default()
+            }],
+            intensity: vec![100.0; mz.len()],
+            mz,
+            ..Default::default()
+        };
+        let query = SpectrumProcessor::new(150, false, 0.0).process(raw);
+
+        for (precursor_tol, fragment_tol) in [
+            (Tolerance::Ppm(-10.0, 10.0), Tolerance::Ppm(-20.0, 20.0)),
+            // windows 1 Da apart with +/-1.5 Da tolerance overlap
+            (Tolerance::Da(-1.5, 1.5), Tolerance::Ppm(-20.0, 20.0)),
+            (Tolerance::Ppm(-50.0, 20.0), Tolerance::Da(-0.02, 0.02)),
+        ] {
+            for (min_iso, max_iso) in [(-1, 3), (0, 2), (0, 1)] {
+                let scorer = Scorer {
+                    db: &db,
+                    precursor_tol,
+                    fragment_tol,
+                    min_matched_peaks: 2,
+                    min_isotope_err: min_iso,
+                    max_isotope_err: max_iso,
+                    min_precursor_charge: 2,
+                    max_precursor_charge: 3,
+                    override_precursor_charge: false,
+                    max_fragment_charge: Some(1),
+                    chimera: false,
+                    report_psms: 1,
+                    wide_window: false,
+                    annotate_matches: false,
+                    score_type: ScoreType::SageHyperScore,
+                };
+                let expected =
+                    per_window_reference(&scorer, &query, precursor_mass, 2, precursor_tol);
+                let mut fused =
+                    scorer.matched_peaks_isotope_windows(&query, precursor_mass, 2, precursor_tol);
+                scorer.trim_hits(&mut fused);
+                assert!(
+                    expected.matched_peaks > 0,
+                    "test spectrum must match something"
+                );
+                assert_eq!(fused.matched_peaks, expected.matched_peaks);
+                assert_eq!(fused.scored_candidates, expected.scored_candidates);
+                assert_eq!(fused.preliminary, expected.preliminary);
+            }
+        }
+    }
 
     #[test]
     fn longest_series() {
