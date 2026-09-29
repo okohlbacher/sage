@@ -91,15 +91,22 @@ impl QueryData {
         for precursor in &mut self.precursors {
             precursor.isolation_window = isolation_window;
 
-            // Several candidate charges ("2+ and 3+") used to become one precursor per
-            // charge, but only the first precursor is searched, so the others were lost.
-            // An unknown charge makes Sage search its configured charge range instead.
-            let mut precursor = precursor.clone();
-            precursor.charge = match self.precursor_charge_array.as_deref() {
-                Some([charge]) => Some(*charge),
-                _ => None,
-            };
-            new_precursors.push(precursor);
+            // One precursor per listed charge ("2+ and 3+"); the scorer searches every
+            // listed charge of a spectrum (see `Scorer::initial_hits`)
+            match self.precursor_charge_array.as_deref() {
+                Some(charges) if !charges.is_empty() => {
+                    let mut seen = Vec::new();
+                    for &charge in charges {
+                        if !seen.contains(&charge) {
+                            seen.push(charge);
+                            let mut precursor = precursor.clone();
+                            precursor.charge = Some(charge);
+                            new_precursors.push(precursor);
+                        }
+                    }
+                }
+                _ => new_precursors.push(precursor.clone()),
+            }
         }
         new_precursors
     }
@@ -413,6 +420,8 @@ mod test {
         // empty or zero charge: unknown, not a dropped spectrum
         assert_eq!(parse_one("CHARGE=")[0].precursors[0].charge, None);
         assert_eq!(parse_one("CHARGE=0")[0].precursors[0].charge, None);
+        // duplicates collapse
+        assert_eq!(parse_one("CHARGE=5+ and 5+")[0].precursors.len(), 1);
     }
 
     #[test]
@@ -447,13 +456,19 @@ mod test {
         assert_eq!(s.id, "spectrum 0");
         assert_eq!(s.ms_level, 2);
         assert_eq!(s.representation, Representation::Centroid);
-        // "2+ and 3+": one precursor with unknown charge, so that both are searched
-        assert_eq!(s.precursors.len(), 1);
-        assert_eq!(s.precursors[0].charge, None);
+        assert_eq!(s.precursors.len(), 2);
+        assert_eq!(s.precursors[0].charge, Some(2));
+        assert_eq!(s.precursors[1].charge, Some(3));
         assert!((s.precursors[0].mz - 367.069682741984).abs() < 0.0001);
         assert_eq!(s.precursors[0].intensity, Some(56700.5185546875));
         assert_eq!(
             s.precursors[0].isolation_window,
+            Some(Tolerance::Ppm(-10.0, 10.0))
+        );
+        assert!((s.precursors[1].mz - 367.069682741984).abs() < 0.0001);
+        assert_eq!(s.precursors[1].intensity, Some(56700.5185546875));
+        assert_eq!(
+            s.precursors[1].isolation_window,
             Some(Tolerance::Ppm(-10.0, 10.0))
         );
         assert!((s.scan_start_time - 0.8963232289 / 60.0).abs() < 0.0001);
@@ -531,9 +546,9 @@ mod test {
         assert_eq!(spectra.len(), 2);
 
         let s = spectra.pop().unwrap();
-        // file-level "2+ and 3+": one precursor with unknown charge (both are searched)
-        assert_eq!(s.precursors.len(), 1);
-        assert_eq!(s.precursors[0].charge, None);
+        assert_eq!(s.precursors.len(), 2);
+        assert_eq!(s.precursors[0].charge, Some(2));
+        assert_eq!(s.precursors[1].charge, Some(3));
         assert_eq!(s.precursors[0].isolation_window, None);
         Ok(())
     }

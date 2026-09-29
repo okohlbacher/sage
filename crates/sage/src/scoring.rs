@@ -551,6 +551,23 @@ impl<'db> Scorer<'db> {
         }
     }
 
+    /// Charges listed for `precursor` when a spectrum carries several precursors at the
+    /// same m/z that differ only in charge (the MGF reader's `CHARGE=2+ and 3+`)
+    fn listed_charges(&self, query: &ProcessedSpectrum, precursor: &Precursor) -> Option<Vec<u8>> {
+        if self.override_precursor_charge || query.precursors.len() < 2 {
+            return None;
+        }
+        let mut charges = query
+            .precursors
+            .iter()
+            .filter(|p| p.mz == precursor.mz)
+            .filter_map(|p| p.charge)
+            .collect::<Vec<_>>();
+        charges.sort_unstable();
+        charges.dedup();
+        (charges.len() > 1).then_some(charges)
+    }
+
     fn initial_hits(&self, query: &ProcessedSpectrum, precursor: &Precursor) -> InitialHits {
         // Sage operates on masses without protons; [M] instead of [MH+]
         let mz = precursor.mz - PROTON;
@@ -570,6 +587,21 @@ impl<'db> Scorer<'db> {
                     hits
                 },
             )
+        } else if let Some(charges) = self.listed_charges(query, precursor) {
+            // Several candidate charges were listed for this precursor (MGF "2+ and 3+"):
+            // search exactly those. Only the first precursor used to be searched.
+            charges
+                .into_iter()
+                .fold(InitialHits::default(), |mut hits, precursor_charge| {
+                    let precursor_mass = mz * precursor_charge as f32;
+                    hits += self.matched_peaks(
+                        query,
+                        precursor_mass,
+                        precursor_charge,
+                        self.precursor_tol,
+                    );
+                    hits
+                })
         } else if precursor.charge.is_some() && !self.override_precursor_charge {
             let charge = precursor.charge.unwrap();
             // Charge state is already annotated for this precusor, only search once
@@ -1071,6 +1103,64 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn all_listed_precursor_charges_are_searched() {
+        let fasta = crate::fasta::Fasta::parse(
+            include_str!("../../../tests/Q99536.fasta").into(),
+            "rev_",
+            true,
+        );
+        let mut builder = Builder::default();
+        builder.update_fasta("unused".into());
+        let db = builder.make_parameters().build(fasta);
+        let target = db.peptides.iter().position(|p| !p.decoy).unwrap() as u32;
+        let mut mz = db
+            .fragments
+            .iter()
+            .filter(|f| f.peptide_index.0 == target)
+            .map(|f| f.fragment_mz + PROTON)
+            .collect::<Vec<_>>();
+        mz.sort_by(f32::total_cmp);
+        // the peptide is 3+, the spectrum lists "2+ and 3+"
+        let precursor_mz = db.peptides[target as usize].monoisotopic / 3.0 + PROTON;
+        let precursor = |charge| Precursor {
+            mz: precursor_mz,
+            charge: Some(charge),
+            ..Default::default()
+        };
+        let raw = RawSpectrum {
+            ms_level: 2,
+            representation: Representation::Centroid,
+            precursors: vec![precursor(2), precursor(3)],
+            intensity: vec![100.0; mz.len()],
+            mz,
+            ..Default::default()
+        };
+        let query = SpectrumProcessor::new(150, false, 0.0).process(raw);
+        let scorer = Scorer {
+            db: &db,
+            precursor_tol: Tolerance::Ppm(-10.0, 10.0),
+            fragment_tol: Tolerance::Ppm(-10.0, 10.0),
+            min_matched_peaks: 2,
+            min_isotope_err: 0,
+            max_isotope_err: 0,
+            // the configured range does not contain 3: only the listed charges count
+            min_precursor_charge: 2,
+            max_precursor_charge: 2,
+            override_precursor_charge: false,
+            max_fragment_charge: Some(1),
+            chimera: false,
+            report_psms: 1,
+            wide_window: false,
+            annotate_matches: false,
+            score_type: ScoreType::SageHyperScore,
+        };
+        let psms = scorer.score(&query);
+        assert_eq!(psms.len(), 1);
+        assert_eq!(psms[0].peptide_idx.0, target);
+        assert_eq!(psms[0].charge, 3);
     }
 
     #[test]
