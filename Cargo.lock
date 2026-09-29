@@ -2669,6 +2669,7 @@ dependencies = [
  "rayon",
  "regex",
  "reqwest 0.11.27",
+ "rusqlite",
  "sage-core",
  "serde",
  "serde_json",

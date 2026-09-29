@@ -39,11 +39,16 @@ impl TdfReader {
         config: BrukerProcessingConfig,
         requires_ms1: bool,
     ) -> Result<Vec<RawSpectrum>, timsrust::TimsRustError> {
-        let spectrum_reader = timsrust::readers::SpectrumReader::build()
-            .with_path(path_name.as_ref())
-            .with_config(config.ms2)
-            .finalize()?;
-        let mut spectra = self.read_msn_spectra(file_id, &spectrum_reader)?;
+        let mut spectra = match dda_frames_once(path_name.as_ref(), file_id, config.ms2) {
+            Some(spectra) => spectra?,
+            None => {
+                let spectrum_reader = timsrust::readers::SpectrumReader::build()
+                    .with_path(path_name.as_ref())
+                    .with_config(config.ms2)
+                    .finalize()?;
+                self.read_msn_spectra(file_id, &spectrum_reader)?
+            }
+        };
         if requires_ms1 {
             let ms1s = self.read_ms1_spectra(&path_name, file_id, config.ms1)?;
             spectra.extend(ms1s);
@@ -401,4 +406,209 @@ impl PeakBuffer {
             .map(|x| (x.mz, (x.intensity, x.im)))
             .unzip()
     }
+}
+
+/// One row of the PASEF table: a precursor's scan range in one MS2 frame
+struct PasefEntry {
+    frame: usize,
+    scan_start: usize,
+    scan_end: usize,
+    isolation_width: f64,
+    precursor: usize,
+}
+
+/// DDA MS2 spectra as timsrust's `SpectrumReader` returns them (same spectra, same
+/// order, same peaks), but each frame decompressed once per block of spectra.
+///
+/// timsrust assembles a spectrum by decompressing every frame its precursor spans, and a
+/// PASEF MS2 frame holds ~9 precursors, so every MS2 frame was decompressed ~9 times.
+/// Returns `None` where this does not apply (not DDA-PASEF, calibration requested, an
+/// unexpected table): the caller then uses timsrust's reader.
+fn dda_frames_once(
+    path: &Path,
+    file_id: usize,
+    config: TimsrustSpectrumConfig,
+) -> Option<Result<Vec<RawSpectrum>, timsrust::TimsRustError>> {
+    use timsrust::readers::{FrameReader, MetadataReader, PrecursorReader, TimsTofPath};
+    if config.spectrum_processing_params.calibrate {
+        return None;
+    }
+    let frames = FrameReader::new(path).ok()?;
+    if frames.get_acquisition() != timsrust::AcquisitionType::DDAPASEF {
+        return None;
+    }
+    let mz_converter = MetadataReader::new(path).ok()?.mz_converter;
+    let precursors = PrecursorReader::build()
+        .with_path(path)
+        .with_config(config.frame_splitting_params)
+        .finalize()
+        .ok()?;
+
+    let tdf = TimsTofPath::new(path).ok()?.tdf().ok()?;
+    let db = rusqlite::Connection::open_with_flags(tdf, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .ok()?;
+    let mut stmt = db
+        .prepare("SELECT Frame, ScanNumBegin, ScanNumEnd, IsolationWidth, Precursor FROM PasefFrameMsMsInfo")
+        .ok()?;
+    // missing values read as 0, as in timsrust
+    let mut pasef = stmt
+        .query_map([], |row| {
+            Ok(PasefEntry {
+                frame: row.get(0).unwrap_or_default(),
+                scan_start: row.get(1).unwrap_or_default(),
+                scan_end: row.get(2).unwrap_or_default(),
+                isolation_width: row.get(3).unwrap_or_default(),
+                precursor: row.get(4).unwrap_or_default(),
+            })
+        })
+        .ok()?
+        .collect::<Result<Vec<_>, _>>()
+        .ok()?;
+    // spectrum i = the i-th precursor id; its frames in table order (stable sort)
+    pasef.sort_by_key(|p| p.precursor);
+    let mut groups = Vec::new();
+    let mut start = 0;
+    for i in 1..=pasef.len() {
+        if i == pasef.len() || pasef[i].precursor != pasef[start].precursor {
+            groups.push(start..i);
+            start = i;
+        }
+    }
+    if groups.is_empty() || groups.len() != precursors.len() {
+        return None;
+    }
+
+    let smoothing = config.spectrum_processing_params.smoothing_window;
+    let centroiding = config.spectrum_processing_params.centroiding_window;
+    // ponytail: fixed block of spectra; bounds decoded frames to ~1000 at a time
+    const BLOCK: usize = 4096;
+    let mut spectra = Vec::with_capacity(groups.len());
+    for (block_ix, block) in groups.chunks(BLOCK).enumerate() {
+        let mut needed = block
+            .iter()
+            .flat_map(|g| pasef[g.clone()].iter().map(|p| p.frame - 1))
+            .collect::<Vec<_>>();
+        needed.sort_unstable();
+        needed.dedup();
+        let decoded = match needed
+            .par_iter()
+            .map(|&f| frames.get(f))
+            .collect::<Result<Vec<_>, _>>()
+        {
+            Ok(decoded) => decoded,
+            Err(e) => {
+                log::error!("cannot read an MS2 frame: {}", e);
+                return Some(Err(e.into()));
+            }
+        };
+        let block_spectra = block
+            .par_iter()
+            .enumerate()
+            .map(|(k, group)| {
+                let index = block_ix * BLOCK + k;
+                let mut isolation_width = 0.0;
+                let mut tof = Vec::new();
+                let mut intensity = Vec::new();
+                for p in &pasef[group.clone()] {
+                    isolation_width = p.isolation_width;
+                    let frame = &decoded[needed.binary_search(&(p.frame - 1)).unwrap()];
+                    if frame.intensities.is_empty() {
+                        continue;
+                    }
+                    let lo = frame.scan_offsets[p.scan_start];
+                    let hi = frame.scan_offsets[p.scan_end];
+                    tof.extend_from_slice(&frame.tof_indices[lo..hi]);
+                    intensity.extend(frame.intensities[lo..hi].iter().map(|&x| x as u64));
+                }
+                let (tof, intensity) = group_and_sum(tof, intensity);
+                let intensity = smooth(&tof, intensity, smoothing);
+                let keep = local_maxima(&tof, &intensity, centroiding);
+                let tims_precursor = precursors.get(index).unwrap();
+                let rt = tims_precursor.rt;
+                let mut precursor = TdfReader::parse_precursor(tims_precursor);
+                precursor.isolation_window = Some(Tolerance::Da(
+                    -isolation_width as f32 / 2.0,
+                    isolation_width as f32 / 2.0,
+                ));
+                RawSpectrum {
+                    file_id,
+                    precursors: vec![precursor],
+                    representation: Representation::Centroid,
+                    scan_start_time: rt as f32 / 60.0,
+                    ion_injection_time: f32::NAN,
+                    total_ion_current: 0.0,
+                    mz: tof
+                        .iter()
+                        .zip(&keep)
+                        .filter(|(_, &k)| k)
+                        .map(|(&t, _)| mz_converter.convert(t) as f32)
+                        .collect(),
+                    ms_level: 2,
+                    id: index.to_string(),
+                    intensity: intensity
+                        .iter()
+                        .zip(&keep)
+                        .filter(|(_, &k)| k)
+                        .map(|(&x, _)| x as f64 as f32)
+                        .collect(),
+                    mobility: None,
+                }
+            })
+            .collect::<Vec<_>>();
+        spectra.extend(block_spectra);
+    }
+    Some(Ok(spectra))
+}
+
+// The three steps below are timsrust 0.4.2's (`vec_utils::group_and_sum`,
+// `RawSpectrum::smooth`, `find_sparse_local_maxima_mask`), which are not public.
+
+/// Sum intensities of equal TOF indices; result sorted by TOF index
+fn group_and_sum(tof: Vec<u32>, intensity: Vec<u64>) -> (Vec<u32>, Vec<u64>) {
+    let mut order = (0..tof.len()).collect::<Vec<_>>();
+    order.sort_by_key(|&i| tof[i]);
+    let mut out_tof: Vec<u32> = Vec::with_capacity(order.len());
+    let mut out_int: Vec<u64> = Vec::with_capacity(order.len());
+    for i in order {
+        if out_tof.last() == Some(&tof[i]) {
+            *out_int.last_mut().unwrap() += intensity[i];
+        } else {
+            out_tof.push(tof[i]);
+            out_int.push(intensity[i]);
+        }
+    }
+    (out_tof, out_int)
+}
+
+/// Add the intensity of every neighbour within `window` TOF indices
+fn smooth(tof: &[u32], intensity: Vec<u64>, window: u32) -> Vec<u64> {
+    let mut smoothed = intensity.clone();
+    for i in 0..tof.len() {
+        for j in i + 1..tof.len() {
+            if tof[j] - tof[i] > window {
+                break;
+            }
+            smoothed[i] += intensity[j];
+            smoothed[j] += intensity[i];
+        }
+    }
+    smoothed
+}
+
+/// Peaks that are not lower than a neighbour within `window` TOF indices
+fn local_maxima(tof: &[u32], intensity: &[u64], window: u32) -> Vec<bool> {
+    let mut keep = vec![true; tof.len()];
+    for i in 0..tof.len() {
+        for j in i + 1..tof.len() {
+            if tof[j] - tof[i] > window {
+                break;
+            }
+            if intensity[i] < intensity[j] {
+                keep[i] = false;
+            } else {
+                keep[j] = false;
+            }
+        }
+    }
+    keep
 }
