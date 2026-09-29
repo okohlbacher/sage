@@ -49,17 +49,25 @@ fn gzip_heuristic(url: &Url) -> bool {
 
 /// Return the filename portion of a URL path. If the filename ends with `.tdf`,
 /// return the parent directory name instead (Bruker `.d` convention).
-pub fn filename(url: &Url) -> Option<&str> {
+///
+/// The name is percent-decoded: URL paths encode spaces and non-ASCII characters
+/// (`my file.mzML` -> `my%20file.mzML`), which ended up in every output file.
+pub fn filename(url: &Url) -> Option<String> {
     let path = url.path();
     let name = path.rsplit('/').next().filter(|s| !s.is_empty());
-    match name {
+    let name = match name {
         Some(n) if n.ends_with("tdf") => {
             let mut iter = path.rsplit('/');
             iter.next();
             iter.next().filter(|s| !s.is_empty())
         }
         other => other,
-    }
+    };
+    name.map(|n| {
+        percent_encoding::percent_decode_str(n)
+            .decode_utf8_lossy()
+            .into_owned()
+    })
 }
 
 fn parse_url(url: &Url) -> Result<(Box<dyn ObjectStore>, object_store::path::Path), Error> {
@@ -178,13 +186,13 @@ mod test {
     #[test]
     fn filename_gcs() {
         let url = Url::parse("gs://my-bucket/path/to/file.mzML").unwrap();
-        assert_eq!(filename(&url), Some("file.mzML"));
+        assert_eq!(filename(&url).as_deref(), Some("file.mzML"));
     }
 
     #[test]
     fn filename_azure() {
         let url = Url::parse("az://my-container/path/to/file.mzML").unwrap();
-        assert_eq!(filename(&url), Some("file.mzML"));
+        assert_eq!(filename(&url).as_deref(), Some("file.mzML"));
     }
 
     #[test]
@@ -225,13 +233,16 @@ mod test {
     #[test]
     fn bruker_filenames() {
         let url = Url::parse("file:///data/20251005_sample_a.d/analysis.tdf").unwrap();
-        assert_eq!(filename(&url), Some("20251005_sample_a.d"));
+        assert_eq!(filename(&url).as_deref(), Some("20251005_sample_a.d"));
 
         let url = Url::parse("s3://bucket/baz/20251005_sample_a.d/analysis.tdf").unwrap();
-        assert_eq!(filename(&url), Some("20251005_sample_a.d"));
+        assert_eq!(filename(&url).as_deref(), Some("20251005_sample_a.d"));
 
         let url = Url::parse("file:///data/baz/20251005_sample_a.mzML").unwrap();
-        assert_eq!(filename(&url), Some("20251005_sample_a.mzML"));
+        assert_eq!(filename(&url).as_deref(), Some("20251005_sample_a.mzML"));
+
+        let url = Url::parse("file:///data/my%20run%20%C3%A4.mzML").unwrap();
+        assert_eq!(filename(&url).as_deref(), Some("my run ä.mzML"));
     }
 
     #[test]

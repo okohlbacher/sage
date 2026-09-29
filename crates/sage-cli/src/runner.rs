@@ -536,11 +536,7 @@ impl Runner {
             .parameters
             .mzml_paths
             .iter()
-            .map(|url| {
-                sage_cloudpath::filename(url)
-                    .unwrap_or_else(|| url.as_str())
-                    .to_string()
-            })
+            .map(|url| sage_cloudpath::filename(url).unwrap_or_else(|| url.as_str().to_string()))
             .collect::<Vec<_>>();
 
         let areas = alignments.and_then(|alignments| {

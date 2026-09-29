@@ -2644,6 +2644,7 @@ dependencies = [
  "log",
  "object_store",
  "parquet 50.0.0",
+ "percent-encoding",
  "quick-xml 0.31.0",
  "rayon",
  "regex",
