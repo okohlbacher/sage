@@ -298,6 +298,72 @@ impl Parameters {
         self.build_from_peptides(target_decoys)
     }
 
+    /// Ions of `peptide` that go into the fragment index (b1, b2, y1, y2... are
+    /// excluded according to `min_ion_index`)
+    fn index_ions<'a>(
+        &'a self,
+        peptide: &'a Peptide,
+    ) -> impl Iterator<Item = crate::ion_series::Ion> + 'a {
+        self.ion_kinds
+            .iter()
+            .flat_map(move |kind| IonSeries::new(peptide, *kind).enumerate())
+            .filter(move |(ion_idx, ion)| match ion.kind {
+                // Don't store b1, b2, y1, y2 ions for preliminary scoring
+                Kind::A | Kind::B | Kind::C => (ion_idx + 1) > self.min_ion_index,
+                Kind::X | Kind::Y | Kind::Z => {
+                    peptide.sequence.len().saturating_sub(1) - ion_idx > self.min_ion_index
+                }
+            })
+            .map(|(_, ion)| ion)
+    }
+
+    /// All theoretical fragments, in peptide order, written into one exact-size
+    /// allocation. Collecting a parallel `flat_map` instead goes through a
+    /// `LinkedList<Vec<_>>` and a concatenation copy, so two copies of the largest
+    /// structure in Sage are alive at once (6.7 GB instead of 3.0 GB peak before
+    /// sorting for human tryptic, 282 M fragments).
+    fn fragments(&self, peptides: &[Peptide]) -> Vec<Theoretical> {
+        self.fragments_in_blocks(peptides, 4096)
+    }
+
+    fn fragments_in_blocks(&self, peptides: &[Peptide], block_size: usize) -> Vec<Theoretical> {
+        let totals: Vec<usize> = peptides
+            .par_chunks(block_size)
+            .map(|chunk| chunk.iter().map(|p| self.index_ions(p).count()).sum())
+            .collect();
+        let total: usize = totals.iter().sum();
+
+        let mut fragments: Vec<Theoretical> = Vec::with_capacity(total);
+        let mut rest = &mut fragments.spare_capacity_mut()[..total];
+        let mut blocks = Vec::with_capacity(totals.len());
+        for &n in &totals {
+            let (head, tail) = std::mem::take(&mut rest).split_at_mut(n);
+            blocks.push(head);
+            rest = tail;
+        }
+        blocks
+            .into_par_iter()
+            .zip(peptides.par_chunks(block_size))
+            .enumerate()
+            .for_each(|(block, (out, chunk))| {
+                let mut i = 0;
+                for (offset, peptide) in chunk.iter().enumerate() {
+                    for ion in self.index_ions(peptide) {
+                        out[i].write(Theoretical {
+                            peptide_index: PeptideIx((block * block_size + offset) as u32),
+                            fragment_mz: ion.monoisotopic_mass,
+                        });
+                        i += 1;
+                    }
+                }
+                assert_eq!(i, out.len(), "fragment count changed between passes");
+            });
+        // SAFETY: the blocks tile `0..total` and each wrote exactly `out.len()`
+        // elements (asserted above), so all `total` elements are initialised.
+        unsafe { fragments.set_len(total) };
+        fragments
+    }
+
     pub fn build_from_peptides(self, target_decoys: Vec<Peptide>) -> IndexedDatabase {
         log::trace!("generating fragments");
 
@@ -305,32 +371,7 @@ impl Parameters {
         // Note that multiple charge states are actually handled by
         // [`SpectrumProcessor`] or during scoring - all theoretical
         // fragments are monoisotopic/uncharged
-        let mut fragments = target_decoys
-            .par_iter()
-            .enumerate()
-            .flat_map_iter(|(idx, peptide)| {
-                // Generate both B and Y ions, then filter down to make sure that
-                // theoretical fragments are within the search space
-                self.ion_kinds
-                    .iter()
-                    .flat_map(|kind| IonSeries::new(peptide, *kind).enumerate())
-                    .filter(|(ion_idx, ion)| {
-                        // Don't store b1, b2, y1, y2 ions for preliminary scoring
-
-                        match ion.kind {
-                            Kind::A | Kind::B | Kind::C => (ion_idx + 1) > self.min_ion_index,
-                            Kind::X | Kind::Y | Kind::Z => {
-                                peptide.sequence.len().saturating_sub(1) - ion_idx
-                                    > self.min_ion_index
-                            }
-                        }
-                    })
-                    .map(move |(_, ion)| Theoretical {
-                        peptide_index: PeptideIx(idx as u32),
-                        fragment_mz: ion.monoisotopic_mass,
-                    })
-            })
-            .collect::<Vec<_>>();
+        let mut fragments = self.fragments(&target_decoys);
         log::trace!("finalizing index");
 
         // Sort all of our theoretical fragments by m/z, from low to high
@@ -669,6 +710,42 @@ mod test {
         assert!(k_entries[1].is_object());
         assert!(k_entries[1].get("max_count").is_none());
         assert!(serialized["variable_mods"]["M"][0].is_number());
+    }
+
+    #[test]
+    fn exact_size_fragments_match_collect() {
+        let mut builder = Builder {
+            enzyme: Some(EnzymeBuilder {
+                missed_cleavages: Some(2),
+                min_len: Some(5),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        builder.update_fasta("unused".into());
+        let params = builder.make_parameters();
+        let fasta = Fasta::parse(
+            include_str!("../../../tests/Q99536.fasta").into(),
+            "rev_",
+            true,
+        );
+        let peptides = params.digest(&fasta);
+        // the previous implementation
+        let expected = peptides
+            .iter()
+            .enumerate()
+            .flat_map(|(idx, peptide)| {
+                params.index_ions(peptide).map(move |ion| Theoretical {
+                    peptide_index: PeptideIx(idx as u32),
+                    fragment_mz: ion.monoisotopic_mass,
+                })
+            })
+            .collect::<Vec<_>>();
+        assert!(expected.len() > 1000);
+        // small blocks so that the block tiling is exercised
+        for block_size in [1, 7, 4096] {
+            assert_eq!(params.fragments_in_blocks(&peptides, block_size), expected);
+        }
     }
 
     #[test]
