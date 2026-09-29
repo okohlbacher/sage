@@ -1,8 +1,9 @@
 use async_compression::tokio::bufread::ZlibDecoder;
-use quick_xml::events::Event;
+use quick_xml::events::{BytesStart, Event};
 use quick_xml::Reader;
 use sage_core::spectrum::{Precursor, Representation};
 use sage_core::{mass::Tolerance, spectrum::RawSpectrum};
+use std::collections::HashMap;
 use tokio::io::{AsyncBufRead, AsyncReadExt};
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -145,42 +146,17 @@ impl MzMLReader {
             }};
         }
 
-        // A document whose `<mzML>` root is never closed is truncated (e.g. an incomplete
-        // download or a cut-off .mzML.gz); reading it as if complete would silently drop
-        // spectra. (Bare `<spectrum>` fragments without a root are accepted.)
-        let (mut root_opened, mut root_closed) = (false, false);
-        loop {
-            match reader.read_event_into_async(&mut buf).await {
-                Ok(Event::Start(ref ev)) => {
-                    root_opened |= ev.name().into_inner() == b"mzML";
-                    // State transition into child tag
-                    state = match (ev.name().into_inner(), state) {
-                        (b"spectrum", _) => Some(State::Spectrum),
-                        (b"scan", Some(State::Spectrum)) => Some(State::Scan),
-                        (b"binaryDataArray", Some(State::Spectrum)) => Some(State::BinaryDataArray),
-                        (b"binary", Some(State::BinaryDataArray)) => Some(State::Binary),
-                        (b"precursor", Some(State::Spectrum)) => Some(State::Precursor),
-                        (b"selectedIon", Some(State::Precursor)) => Some(State::SelectedIon),
-                        _ => state,
-                    };
-                    match ev.name().into_inner() {
-                        b"spectrum" => {
-                            let id = extract!(ev, b"id");
-                            let id = std::str::from_utf8(&id)?;
-                            spectrum.id = id.to_string();
-                        }
-                        b"precursor" => {
-                            // Not all precursor fields have a spectrumRef
-                            if let Some(scan) = ev.try_get_attribute(b"spectrumRef")? {
-                                let scan = std::str::from_utf8(&scan.value)?;
-                                precursor.spectrum_ref = Some(scan.to_string())
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-                Ok(Event::Empty(ref ev)) => match (state, ev.name().into_inner()) {
-                    (Some(State::BinaryDataArray), b"cvParam") => {
+        let mut param_groups: HashMap<Vec<u8>, Vec<BytesStart<'static>>> = HashMap::new();
+        let mut current_group: Option<Vec<u8>> = None;
+
+        // cvParam handling, shared by inline cvParams and by cvParams replayed from a
+        // referenceableParamGroup (upstream #232: some converters put e.g. the centroid
+        // flag or the MS level into a group)
+        macro_rules! handle_cv {
+            ($ev:expr) => {{
+                let ev = $ev;
+                match state {
+                    Some(State::BinaryDataArray) => {
                         let accession = extract!(ev, b"accession");
                         match accession.as_ref() {
                             ZLIB_COMPRESSION => compression = true,
@@ -196,7 +172,7 @@ impl MzMLReader {
                             }
                         }
                     }
-                    (Some(State::Spectrum), b"cvParam") => {
+                    Some(State::Spectrum) => {
                         let accession = extract!(ev, b"accession");
                         match accession.as_ref() {
                             MS_LEVEL => {
@@ -224,7 +200,7 @@ impl MzMLReader {
                             _ => {}
                         }
                     }
-                    (Some(State::Precursor), b"cvParam") => {
+                    Some(State::Precursor) => {
                         let accession = extract!(ev, b"accession");
                         match accession.as_ref() {
                             ISO_WINDOW_TARGET => {
@@ -240,7 +216,7 @@ impl MzMLReader {
                             _ => {}
                         }
                     }
-                    (Some(State::SelectedIon), b"cvParam") => {
+                    Some(State::SelectedIon) => {
                         let accession = extract!(ev, b"accession");
                         match accession.as_ref() {
                             SELECTED_ION_CHARGE => {
@@ -261,7 +237,7 @@ impl MzMLReader {
                             _ => {}
                         }
                     }
-                    (Some(State::Scan), b"cvParam") => {
+                    Some(State::Scan) => {
                         let accession = extract!(ev, b"accession");
                         match accession.as_ref() {
                             SCAN_START_TIME => {
@@ -284,6 +260,68 @@ impl MzMLReader {
                         }
                     }
 
+                    _ => {}
+                }
+            }};
+        }
+
+        // A document whose `<mzML>` root is never closed is truncated (e.g. an incomplete
+        // download or a cut-off .mzML.gz); reading it as if complete would silently drop
+        // spectra. (Bare `<spectrum>` fragments without a root are accepted.)
+        let (mut root_opened, mut root_closed) = (false, false);
+        loop {
+            match reader.read_event_into_async(&mut buf).await {
+                Ok(Event::Start(ref ev)) => {
+                    root_opened |= ev.name().into_inner() == b"mzML";
+                    match ev.name().into_inner() {
+                        b"referenceableParamGroup" => {
+                            current_group = Some(extract!(ev, b"id").to_vec())
+                        }
+                        // `<cvParam ...></cvParam>` is legal too
+                        b"cvParam" if current_group.is_none() => handle_cv!(ev),
+                        _ => {}
+                    }
+                    // State transition into child tag
+                    state = match (ev.name().into_inner(), state) {
+                        (b"spectrum", _) => Some(State::Spectrum),
+                        (b"scan", Some(State::Spectrum)) => Some(State::Scan),
+                        (b"binaryDataArray", Some(State::Spectrum)) => Some(State::BinaryDataArray),
+                        (b"binary", Some(State::BinaryDataArray)) => Some(State::Binary),
+                        (b"precursor", Some(State::Spectrum)) => Some(State::Precursor),
+                        (b"selectedIon", Some(State::Precursor)) => Some(State::SelectedIon),
+                        _ => state,
+                    };
+                    match ev.name().into_inner() {
+                        b"spectrum" => {
+                            let id = extract!(ev, b"id");
+                            let id = std::str::from_utf8(&id)?;
+                            spectrum.id = id.to_string();
+                        }
+                        b"precursor" => {
+                            // Not all precursor fields have a spectrumRef
+                            if let Some(scan) = ev.try_get_attribute(b"spectrumRef")? {
+                                let scan = std::str::from_utf8(&scan.value)?;
+                                precursor.spectrum_ref = Some(scan.to_string())
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                Ok(Event::Empty(ref ev)) => match ev.name().into_inner() {
+                    b"cvParam" => match &current_group {
+                        Some(id) => param_groups
+                            .entry(id.clone())
+                            .or_default()
+                            .push(ev.clone().into_owned()),
+                        None => handle_cv!(ev),
+                    },
+                    b"referenceableParamGroupRef" => {
+                        let id = extract!(ev, b"ref").to_vec();
+                        let params = param_groups.get(&id).cloned().unwrap_or_default();
+                        for param in &params {
+                            handle_cv!(param);
+                        }
+                    }
                     _ => {}
                 },
                 Ok(Event::Text(text)) => {
@@ -351,6 +389,9 @@ impl MzMLReader {
                 }
                 Ok(Event::End(ev)) => {
                     root_closed |= ev.name().into_inner() == b"mzML";
+                    if ev.name().into_inner() == b"referenceableParamGroup" {
+                        current_group = None;
+                    }
                     state = match (state, ev.name().into_inner()) {
                         (Some(State::Binary), b"binary") => Some(State::BinaryDataArray),
                         (Some(State::BinaryDataArray), b"binaryDataArray") => Some(State::Spectrum),
@@ -437,6 +478,40 @@ mod test {
     use sage_core::{mass::Tolerance, spectrum::Representation};
 
     use super::{MzMLError, MzMLReader};
+
+    #[tokio::test]
+    async fn referenceable_param_groups_are_resolved() {
+        let full = include_str!("../../../tests/LQSRPAAPPAPGPGQLTLR.mzML");
+        let ms_level = r#"<cvParam cvRef="MS" accession="MS:1000511" name="ms level" value="2"/>"#;
+        let centroid =
+            r#"<cvParam cvRef="MS" accession="MS:1000127" name="centroid spectrum" value=""/>"#;
+        assert!(full.contains(ms_level) && full.contains(centroid));
+        // move MS level and centroid flag of the spectrum into a param group
+        let grouped = full
+            .replacen(ms_level, r#"<referenceableParamGroupRef ref="ms2"/>"#, 1)
+            .replacen(centroid, "", 1)
+            .replacen(
+                r#"<referenceableParamGroupList count="1">"#,
+                &format!(
+                    r#"<referenceableParamGroupList count="2">
+                    <referenceableParamGroup id="ms2">{ms_level}{centroid}</referenceableParamGroup>"#
+                ),
+                1,
+            );
+        let expected = MzMLReader::with_file_id(0)
+            .parse(full.as_bytes())
+            .await
+            .unwrap();
+        let parsed = MzMLReader::with_file_id(0)
+            .parse(grouped.as_bytes())
+            .await
+            .unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].ms_level, 2);
+        assert_eq!(parsed[0].representation, Representation::Centroid);
+        assert_eq!(parsed[0].mz, expected[0].mz);
+        assert_eq!(parsed[0].precursors.len(), expected[0].precursors.len());
+    }
 
     #[tokio::test]
     async fn truncated_file_is_an_error() {
