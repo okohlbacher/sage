@@ -1061,7 +1061,16 @@ mod tests {
             (Tolerance::Da(-1.5, 1.5), Tolerance::Ppm(-20.0, 20.0)),
             (Tolerance::Ppm(-50.0, 20.0), Tolerance::Da(-0.02, 0.02)),
         ] {
-            for (min_iso, max_iso) in [(-1, 3), (0, 2), (0, 1), (1, 1)] {
+            for (min_iso, max_iso, charge, frag_charge) in [
+                (-1, 3, 2, Some(1)),
+                (0, 2, 2, Some(1)),
+                (0, 1, 2, Some(1)),
+                (1, 1, 2, Some(1)),
+                // fragment-charge folding with higher precursor charges
+                (0, 2, 3, Some(2)),
+                (-1, 3, 4, None),
+                (0, 1, 4, Some(3)),
+            ] {
                 let scorer = Scorer {
                     db: &db,
                     precursor_tol,
@@ -1072,7 +1081,7 @@ mod tests {
                     min_precursor_charge: 2,
                     max_precursor_charge: 3,
                     override_precursor_charge: false,
-                    max_fragment_charge: Some(1),
+                    max_fragment_charge: frag_charge,
                     chimera: false,
                     report_psms: 1,
                     wide_window: false,
@@ -1080,9 +1089,13 @@ mod tests {
                     score_type: ScoreType::SageHyperScore,
                 };
                 let expected =
-                    per_window_reference(&scorer, &query, precursor_mass, 2, precursor_tol);
-                let mut fused =
-                    scorer.matched_peaks_isotope_windows(&query, precursor_mass, 2, precursor_tol);
+                    per_window_reference(&scorer, &query, precursor_mass, charge, precursor_tol);
+                let mut fused = scorer.matched_peaks_isotope_windows(
+                    &query,
+                    precursor_mass,
+                    charge,
+                    precursor_tol,
+                );
                 scorer.trim_hits(&mut fused);
                 assert!(
                     expected.matched_peaks > 0,
@@ -1093,7 +1106,8 @@ mod tests {
                 assert_eq!(fused.preliminary, expected.preliminary);
 
                 // what the scorer actually runs (single window: `isotope_errors [n, n]`)
-                let mut actual = scorer.matched_peaks(&query, precursor_mass, 2, precursor_tol);
+                let mut actual =
+                    scorer.matched_peaks(&query, precursor_mass, charge, precursor_tol);
                 let mut expected = expected.preliminary;
                 actual.preliminary.sort();
                 expected.sort();

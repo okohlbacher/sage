@@ -272,7 +272,7 @@ The enzyme section contains parameters related to the enzyme used for digestion.
 - **min_len**: Integer. The minimum amino acid (AA) length of peptides to search (default: 5).
 - **max_len**: Integer. The maximum AA length of peptides to search (default: 50).
 - **cleave_at**: String. Amino acids to cleave at (default: 'KR').
-- **restrict**: String. Do not cleave if one of these amino acids follows the cleavage site (default: 'P').
+- **restrict**: String. Do not cleave if one of these amino acids follows the cleavage site. Default: 'P' when `cleave_at` is omitted (trypsin); no restriction when a custom `cleave_at` is given without `restrict`. Use `""` or `null` for no restriction.
 - **c_terminal**: Boolean. Cleave at the C-terminus of matching amino acids (default:true).
 
 Example: 
@@ -350,7 +350,7 @@ Example:
 ### Decoys
 
 - **decoy_tag**: String. The tag used to identify decoy entries in the FASTA database (default: "rev_").
-- **generate_decoys**: Boolean. If true, ignore decoys in the FASTA database matching `decoy_tag`, and generate internally reversed peptides (default: false).
+- **generate_decoys**: Boolean. If true, ignore decoys in the FASTA database matching `decoy_tag`, and generate internally reversed peptides (default: true).
 
 ### FASTA
 
@@ -492,7 +492,7 @@ The "results.sage.tsv" file contains the following columns (headers):
 - `scored_candidates`: Number of scored candidates for this spectrum.
 - `poisson`: Probability of matching exactly N peaks across all candidates (Pr(x=k)).
 - `sage_discriminant_score`: Combined score from linear discriminant analysis, used for FDR (False Discovery Rate) calculation.
-- `posterior_error`: Posterior error probability for this PSM / local FDR.
+- `posterior_error`: log10 of the posterior error probability (local FDR) of this PSM, i.e. 0 means PEP = 1 and -2 means PEP = 0.01. Estimated as min(1, p / (1 - p)) from the KDE's probability p that a PSM with this discriminant score is a decoy. 0 when the LDA model could not be fitted.
 - `spectrum_q`: Assigned spectrum-level q-value.
 - `peptide_q`: Assigned peptide-level q-value.
 - `protein_q`: Assigned protein-level q-value.

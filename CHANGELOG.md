@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Per-modification occurrence limits using `{"mass": <mass>, "max_count": <limit>}` entries in `database.variable_mods`; existing bare-mass entries remain supported.
 - `database.max_combinations` to cap the number of peptide variants (including the unmodified form) generated from variable modifications, preferring variants with fewer modifications.
 
+### Changed
+- Performance: about 2.8-3.4x faster end to end and ~2 GB lower peak memory on a 3-file timsTOF DDA benchmark (human, 7.7 M peptides), with identical identifications. Isotope windows share one fragment lookup, a per-page skip table narrows fragment lookups, KDE fits parallelise over bins, the fragment index is built in one exact-size allocation on transparent huge pages, digest grouping is parallel, spectra are processed per file, the database build overlaps with reading the first batch, the database is not freed at exit, and mimalloc is the global allocator.
+- mzML: MS1 spectra are no longer decoded or kept unless LFQ is enabled.
+- A file that cannot be read completely (I/O error, truncated or corrupt mzML/MGF, unreadable Bruker frames) now fails the run with an error naming the file, instead of being searched partially or skipped with exit code 0. Unsupported file formats are rejected before the database is built.
+- `posterior_error` now reports the PEP of a target PSM (min(1, p/(1-p))); it used to report the probability of being a decoy, which is ~2x too optimistic for low-scoring PSMs. It is 0 (PEP = 1) when the LDA falls back to the heuristic score. q-values are unchanged.
+- The PIN file no longer contains `posterior_error` (it is derived from Sage's own label-trained model and leaked target/decoy labels into Percolator/mokapot); `sqrt(delta_mobility)` now holds the square root, as its header says.
+- An `enzyme` block without `cleave_at` keeps trypsin's `restrict: "P"` default (e.g. `{"missed_cleavages": 2}` used to cleave before P).
+- MGF spectra listing several charges (`CHARGE=2+ and 3+`) are searched at every listed charge (only the first was searched).
+- The logged "target peptide-spectrum matches" count no longer includes passing decoys.
+- FASTA sequences are upper-cased and a terminal `*` is removed; empty headers get `unnamed_protein_<n>`.
+- Output file names are percent-decoded (`my file.mzML`, not `my%20file.mzML`).
+
+### Fixed
+- Crashes of the whole run: `*`/lower-case/non-letters after a cleavage site, FASTA or prefilter chunks without peptides, profile MS2 spectra (now skipped with a warning), m/z and intensity arrays of different lengths, MS2 spectra without precursor m/z, batch size 0 on single-CPU machines, NaN values in the HTML report.
+- mzML: `referenceableParamGroupRef` is resolved (#232); MS-Numpress arrays are rejected instead of decoded as garbage; unknown cvParams no longer drop arrays; per-spectrum state no longer leaks into the next spectrum; multi-member gzip files are read completely; `.GZ` is recognised.
+- MGF: multi-digit charges (`CHARGE=10+`), empty files, `PEPMASS` of 0.
+- Low-memory prefilter kept the highest peptide indices instead of the best-scoring candidates; decoys colliding with targets across prefilter chunks corrupted protein lists.
+- `isotope_errors: [n, n]` with n != 0 searched isotope 0.
+- Files without retention times (MGF without RTINSECONDS) disabled LDA rescoring for the whole run and distorted RT alignment and the RT model of the other files.
+- Bruker `ion_injection_time` reported the retention time.
+
 ## [v0.15.0]
 ### Added
 - IDPicker-based protein grouping with picked group FDR control (`protein_grouping` setting, enabled by default). Proteins are grouped using a bipartite graph greedy set cover approach, and protein group-level q-values are reported via target-decoy competition. New output columns: `protein_groups`, `num_protein_groups`, `protein_group_q`.
