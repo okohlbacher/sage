@@ -130,6 +130,22 @@ impl LinearDiscriminantAnalysis {
     }
 }
 
+/// Posterior error probability of a *target* PSM from the KDE's P(decoy | score).
+///
+/// The KDE is fitted on targets and decoys together, so it estimates the probability
+/// that a PSM with this score is a decoy: ~0.5 where the score carries no information,
+/// because false targets and decoys are equally frequent there. The PEP of a target is
+/// the expected number of false targets per target, i.e. decoys per target:
+/// p / (1 - p), capped at 1. (Measured on PXD041421: the old column was exactly 2x
+/// optimistic in the null region and correct for confident PSMs.)
+fn target_pep(p_decoy: f64) -> f64 {
+    if p_decoy >= 0.5 {
+        1.0
+    } else {
+        p_decoy / (1.0 - p_decoy)
+    }
+}
+
 pub fn score_psms(scores: &mut [Feature], precursor_tol: Tolerance) -> Option<()> {
     log::trace!("fitting linear discriminant model...");
     let decoys = scores
@@ -219,7 +235,7 @@ pub fn score_psms(scores: &mut [Feature], precursor_tol: Tolerance) -> Option<()
         .zip(&discriminants)
         .for_each(|(perc, score)| {
             perc.discriminant_score = *score as f32;
-            perc.posterior_error = kde.posterior_error(*score).log10() as f32;
+            perc.posterior_error = target_pep(kde.posterior_error(*score)).log10() as f32;
             if perc.posterior_error.is_infinite() {
                 // This is approximately the log10 of the smallest positive
                 // non-zero f64
@@ -233,6 +249,15 @@ pub fn score_psms(scores: &mut [Feature], precursor_tol: Tolerance) -> Option<()
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[test]
+    fn target_pep_from_decoy_probability() {
+        assert_eq!(target_pep(0.5), 1.0);
+        assert_eq!(target_pep(0.9), 1.0);
+        assert!((target_pep(1.0 / 3.0) - 0.5).abs() < 1e-12);
+        assert!((target_pep(0.01) - 0.010101).abs() < 1e-6);
+        assert_eq!(target_pep(0.0), 0.0);
+    }
     use crate::ml::*;
 
     #[test]

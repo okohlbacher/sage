@@ -255,7 +255,9 @@ impl Runner {
         {
             log::warn!("linear model fitting failed, falling back to heuristic discriminant score");
             features.par_iter_mut().for_each(|feat| {
-                feat.discriminant_score = (-feat.poisson as f32).ln_1p() + feat.longest_y_pct / 3.0
+                feat.discriminant_score = (-feat.poisson as f32).ln_1p() + feat.longest_y_pct / 3.0;
+                // no PEP model: log10(PEP = 1). The default 1.0 meant "PEP = 10".
+                feat.posterior_error = 0.0;
             });
         }
         features.par_sort_unstable_by(|a, b| b.discriminant_score.total_cmp(&a.discriminant_score));
@@ -1020,9 +1022,10 @@ impl Runner {
                 .as_bytes(),
         );
         record.push_field(ryu::Buffer::new().format(feature.predicted_ims).as_bytes());
+        // the header says sqrt(delta_mobility); transform like delta_rt_model above
         record.push_field(
             ryu::Buffer::new()
-                .format(feature.delta_ims_model)
+                .format(feature.delta_ims_model.clamp(0.001, 1.0).sqrt())
                 .as_bytes(),
         );
         record.push_field(itoa::Buffer::new().format(feature.matched_peaks).as_bytes());
@@ -1044,11 +1047,9 @@ impl Runner {
                 .format((-feature.poisson).ln_1p())
                 .as_bytes(),
         );
-        record.push_field(
-            ryu::Buffer::new()
-                .format(feature.posterior_error)
-                .as_bytes(),
-        );
+        // `posterior_error` is not a PIN feature: it comes from Sage's own LDA, trained on
+        // the target/decoy labels of these same PSMs, so it would leak the labels into the
+        // rescorer (Percolator/mokapot cross-validation cannot undo that)
         record.push_field(peptide.to_string().as_bytes());
         record.push_field(
             peptide
@@ -1102,7 +1103,6 @@ impl Runner {
             "ln(matched_intensity_pct)",
             "scored_candidates",
             "ln(-poisson)",
-            "posterior_error",
             "Peptide",
             "Proteins",
         ]);
