@@ -317,7 +317,8 @@ impl QueryParser {
 
             match query_data.check_spectrum(&spectrum) {
                 Ok(_) => query_data.spectra.push(spectrum),
-                Err(err) => eprintln!("{}", err),
+                // e.g. a block without peaks or precursor: skip it, but visibly
+                Err(err) => log::warn!("skipping MGF spectrum `{}`: {}", spectrum.id, err),
             }
             query_data.init();
 
@@ -354,26 +355,40 @@ impl MgfReader {
                 match parser(line, &mut default_params) {
                     Ok(true) => break,
                     Ok(false) => continue,
-                    Err(err) => eprintln!("{}", err),
+                    // header lines may be Mascot query lines etc.; not fatal
+                    Err(err) => log::warn!("ignoring MGF header line `{}`: {}", line, err),
                 }
             }
         }
 
         let mut query_data = QueryData::default_with_params(default_params);
 
-        // query
+        // query. Errors fail the file: printing them and continuing returned the rest of a
+        // corrupt file as if it were complete.
+        let mut in_block = true; // the default-parameter loop stopped at `BEGIN IONS`
         for line in lines {
             if line.is_empty() {
                 continue;
             }
             let line = line.trim();
+            if line.starts_with("BEGIN IONS") {
+                in_block = true;
+            } else if line.starts_with("END IONS") {
+                in_block = false;
+            }
             for parser in &query_parsers {
                 match parser(line, &mut query_data) {
                     Ok(true) => break,
                     Ok(false) => {}
-                    Err(err) => eprintln!("{}", err),
+                    Err(err) => return Err(err),
                 }
             }
+        }
+        if in_block {
+            // file ends inside an ions block: truncated
+            return Err(MgfError::Malformed {
+                location: *Location::caller(),
+            });
         }
         Ok(query_data.spectra)
     }
@@ -422,6 +437,21 @@ mod test {
         assert_eq!(parse_one("CHARGE=0")[0].precursors[0].charge, None);
         // duplicates collapse
         assert_eq!(parse_one("CHARGE=5+ and 5+")[0].precursors.len(), 1);
+    }
+
+    #[test]
+    fn truncated_or_corrupt_blocks_fail_the_file() {
+        let ok = "BEGIN IONS\nTITLE=a\nPEPMASS=500.25\nCHARGE=2+\n100.1 5\n200.2 7\nEND IONS\n";
+        assert_eq!(
+            MgfReader::with_file_id(0).parse(ok.into()).unwrap().len(),
+            1
+        );
+        // second block cut off before END IONS
+        let truncated = format!("{ok}BEGIN IONS\nTITLE=b\nPEPMASS=600.3\n100.1 5\n");
+        assert!(MgfReader::with_file_id(0).parse(truncated).is_err());
+        // corrupt peak line inside a block
+        let corrupt = ok.replace("100.1 5", "10x0.1 5");
+        assert!(MgfReader::with_file_id(0).parse(corrupt).is_err());
     }
 
     #[test]

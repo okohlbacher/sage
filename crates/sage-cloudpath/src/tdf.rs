@@ -98,16 +98,14 @@ impl TdfReader {
                             total_ion_current,
                             mobility: Some(mobility),
                         };
-                        Some(spec)
+                        Ok(spec)
                     }
-                    Err(x) => {
-                        log::error!("error parsing spectrum: {:?}", x);
-                        None
-                    }
+                    // a frame that cannot be read fails the file (it used to be logged and
+                    // dropped, so a corrupt .d was searched partially without failing)
+                    Err(x) => Err(x),
                 },
             )
-            .flatten()
-            .collect();
+            .collect::<Result<_, _>>()?;
         log::info!(
             "read {} ms1 spectra in {:#?}",
             ms1_spectra.len(),
@@ -123,8 +121,8 @@ impl TdfReader {
     ) -> Result<Vec<RawSpectrum>, timsrust::TimsRustError> {
         let spectra: Vec<RawSpectrum> = (0..spectrum_reader.len())
             .into_par_iter()
-            .filter_map(|index| match spectrum_reader.get(index) {
-                Ok(dda_spectrum) => match dda_spectrum.precursor {
+            .map(|index| match spectrum_reader.get(index) {
+                Ok(dda_spectrum) => Ok(match dda_spectrum.precursor {
                     Some(dda_precursor) => {
                         let mut precursor = Self::parse_precursor(dda_precursor);
                         precursor.isolation_window = Option::from(Tolerance::Da(
@@ -149,9 +147,13 @@ impl TdfReader {
                         Some(spectrum)
                     }
                     None => None,
-                },
-                Err(_) => None,
+                }),
+                // a spectrum that cannot be read fails the file instead of being dropped
+                Err(e) => Err(e),
             })
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .flatten()
             .collect();
         Ok(spectra)
     }
