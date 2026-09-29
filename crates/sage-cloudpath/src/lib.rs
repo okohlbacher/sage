@@ -167,6 +167,8 @@ pub enum Error {
     TDF(#[from] timsrust::TimsRustError),
     #[error("MGF error: {0}")]
     MGF(#[from] mgf::MgfError),
+    #[error("unsupported file format: {0} (expected .mzML[.gz], .mgf[.gz] or a Bruker .d)")]
+    UnsupportedFormat(String),
 }
 
 #[cfg(test)]

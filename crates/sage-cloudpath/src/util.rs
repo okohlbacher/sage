@@ -30,7 +30,9 @@ impl FileFormat {
 
 impl From<&str> for FileFormat {
     fn from(s: &str) -> Self {
-        let path_lower = s.to_lowercase();
+        // ignore the query of URLs such as presigned S3 links (`...file.mzML?X-Amz-...`)
+        let path = s.split('?').next().unwrap_or(s);
+        let path_lower = path.to_lowercase();
         if path_lower.ends_with(".mgf.gz") || path_lower.ends_with(".mgf") {
             FileFormat::MGF
         } else if is_bruker(&path_lower) {
@@ -68,7 +70,7 @@ pub fn read_spectra(
         FileFormat::MzML => read_mzml(url, file_id, sn),
         FileFormat::MGF => read_mgf(url, file_id),
         FileFormat::TDF => read_tdf(url, file_id, bruker_processor, requires_ms1),
-        FileFormat::Unidentified => panic!("Unable to get type for '{}'", url), // read_mzml(path, file_id, sn),
+        FileFormat::Unidentified => Err(Error::UnsupportedFormat(url.to_string())),
     }
 }
 
@@ -181,5 +183,10 @@ mod test {
         assert_eq!(FileFormat::from("foo.tdf"), FileFormat::TDF);
         assert_eq!(FileFormat::from("./tomato/foo.d"), FileFormat::TDF);
         assert_eq!(FileFormat::from("./tomato/foo.d/"), FileFormat::TDF);
+        assert_eq!(
+            FileFormat::from("s3://bucket/foo.mzML?X-Amz-Signature=abc"),
+            FileFormat::MzML
+        );
+        assert_eq!(FileFormat::from("foo.mzXML"), FileFormat::Unidentified);
     }
 }

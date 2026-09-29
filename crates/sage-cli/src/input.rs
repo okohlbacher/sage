@@ -322,6 +322,22 @@ impl Input {
             .map(|s| sage_cloudpath::to_url(s))
             .collect::<Result<Vec<_>, _>>()?;
 
+        // Fail before the (possibly long) database build, not halfway through the run
+        let unsupported = mzml_paths
+            .iter()
+            .filter(|url| {
+                sage_cloudpath::FileFormat::from(url.as_str())
+                    == sage_cloudpath::FileFormat::Unidentified
+            })
+            .map(|url| url.to_string())
+            .collect::<Vec<_>>();
+        if !unsupported.is_empty() {
+            anyhow::bail!(
+                "unsupported input file format (expected .mzML[.gz], .mgf[.gz] or a Bruker .d): {}",
+                unsupported.join(", ")
+            );
+        }
+
         let output_directory = match self.output_directory {
             Some(path) => {
                 match sage_cloudpath::try_parse_url(&path) {

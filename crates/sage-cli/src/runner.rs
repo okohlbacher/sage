@@ -71,7 +71,7 @@ impl Runner {
                     || parameters.database.clone().build(fasta),
                     || reader.read_processed_spectra(batch, 0, parallel),
                 );
-                first_batch = Some(spectra);
+                first_batch = Some(spectra?);
                 database
             }
             true => {
@@ -93,7 +93,7 @@ impl Runner {
                         start,
                         first_batch: None,
                     };
-                    let peptides = mini_runner.prefilter_peptides(parallel, fasta);
+                    let peptides = mini_runner.prefilter_peptides(parallel, fasta)?;
                     parameters.database.clone().build_from_peptides(peptides)
                 }
             }
@@ -113,11 +113,11 @@ impl Runner {
         })
     }
 
-    pub fn prefilter_peptides(self, parallel: usize, fasta: Fasta) -> Vec<Peptide> {
+    pub fn prefilter_peptides(self, parallel: usize, fasta: Fasta) -> anyhow::Result<Vec<Peptide>> {
         let spectra: Option<Vec<ProcessedSpectrum>> =
             match parallel >= self.parameters.mzml_paths.len() {
                 true => Some(
-                    self.read_processed_spectra(&self.parameters.mzml_paths, 0, 0)
+                    self.read_processed_spectra(&self.parameters.mzml_paths, 0, 0)?
                         .1,
                 ),
                 false => None,
@@ -131,85 +131,84 @@ impl Runner {
         //
         // db_params.generate_decoys = false;
 
-        let mut all_peptides: Vec<Peptide> = fasta
+        let mut all_peptides: Vec<Peptide> = Vec::new();
+        for (chunk_id, fasta_chunk) in fasta
             .iter_chunks(self.parameters.database.prefilter_chunk_size)
             .enumerate()
-            .flat_map(|(chunk_id, fasta_chunk)| {
-                let start = Instant::now();
-                info!("pre-filtering fasta chunk {}", chunk_id,);
-                let mut db = db_params.clone().build(fasta_chunk);
+        {
+            let start = Instant::now();
+            info!("pre-filtering fasta chunk {}", chunk_id,);
+            let mut db = db_params.clone().build(fasta_chunk);
 
-                info!(
-                    "generated {} fragments, {} peptides in {}ms",
-                    db.fragments.len(),
-                    db.peptides.len(),
-                    (Instant::now() - start).as_millis()
-                );
+            info!(
+                "generated {} fragments, {} peptides in {}ms",
+                db.fragments.len(),
+                db.peptides.len(),
+                (Instant::now() - start).as_millis()
+            );
 
-                let scorer = Scorer {
-                    db: &db,
-                    precursor_tol: self.parameters.precursor_tol,
-                    fragment_tol: self.parameters.fragment_tol,
-                    min_matched_peaks: self.parameters.min_matched_peaks,
-                    min_isotope_err: self.parameters.isotope_errors.0,
-                    max_isotope_err: self.parameters.isotope_errors.1,
-                    min_precursor_charge: self.parameters.precursor_charge.0,
-                    max_precursor_charge: self.parameters.precursor_charge.1,
-                    override_precursor_charge: self.parameters.override_precursor_charge,
-                    max_fragment_charge: self.parameters.max_fragment_charge,
-                    chimera: self.parameters.chimera,
-                    report_psms: self.parameters.report_psms + 1, // Q: Why is 1 being added here? (JSPP: Feb 2024)
-                    wide_window: self.parameters.wide_window,
-                    annotate_matches: self.parameters.annotate_matches,
-                    score_type: self.parameters.score_type,
-                };
+            let scorer = Scorer {
+                db: &db,
+                precursor_tol: self.parameters.precursor_tol,
+                fragment_tol: self.parameters.fragment_tol,
+                min_matched_peaks: self.parameters.min_matched_peaks,
+                min_isotope_err: self.parameters.isotope_errors.0,
+                max_isotope_err: self.parameters.isotope_errors.1,
+                min_precursor_charge: self.parameters.precursor_charge.0,
+                max_precursor_charge: self.parameters.precursor_charge.1,
+                override_precursor_charge: self.parameters.override_precursor_charge,
+                max_fragment_charge: self.parameters.max_fragment_charge,
+                chimera: self.parameters.chimera,
+                report_psms: self.parameters.report_psms + 1, // Q: Why is 1 being added here? (JSPP: Feb 2024)
+                wide_window: self.parameters.wide_window,
+                annotate_matches: self.parameters.annotate_matches,
+                score_type: self.parameters.score_type,
+            };
 
-                // Allocate an array of booleans indicating whether a peptide was identified in a
-                // preliminary pass of the data
-                let keep = (0..db.peptides.len())
-                    .map(|_| std::sync::atomic::AtomicBool::new(false))
-                    .collect::<Vec<_>>();
+            // Allocate an array of booleans indicating whether a peptide was identified in a
+            // preliminary pass of the data
+            let keep = (0..db.peptides.len())
+                .map(|_| std::sync::atomic::AtomicBool::new(false))
+                .collect::<Vec<_>>();
 
-                match &spectra {
-                    Some(spectra) => self.peptide_filter_processed_spectra(&scorer, spectra, &keep),
-                    None => self
-                        .parameters
-                        .mzml_paths
-                        .chunks(parallel)
-                        .enumerate()
-                        .for_each(|(chunk_idx, chunk)| {
-                            let spectra_chunk =
-                                self.read_processed_spectra(chunk, chunk_idx, parallel).1;
-                            self.peptide_filter_processed_spectra(&scorer, &spectra_chunk, &keep)
-                        }),
-                };
+            match &spectra {
+                Some(spectra) => self.peptide_filter_processed_spectra(&scorer, spectra, &keep),
+                None => {
+                    for (chunk_idx, chunk) in
+                        self.parameters.mzml_paths.chunks(parallel).enumerate()
+                    {
+                        let spectra_chunk =
+                            self.read_processed_spectra(chunk, chunk_idx, parallel)?.1;
+                        self.peptide_filter_processed_spectra(&scorer, &spectra_chunk, &keep)
+                    }
+                }
+            };
 
-                // Retain only peptides where `keep[ix] = true`
-                let peptides = db
-                    .peptides
-                    .drain(..)
-                    .enumerate()
-                    .filter_map(|(ix, peptide)| {
-                        let val = keep[ix].load(std::sync::atomic::Ordering::Relaxed);
-                        if val {
-                            Some(peptide)
-                        } else {
-                            None
-                        }
-                    })
-                    .collect::<Vec<_>>();
+            // Retain only peptides where `keep[ix] = true`
+            let peptides = db
+                .peptides
+                .drain(..)
+                .enumerate()
+                .filter_map(|(ix, peptide)| {
+                    let val = keep[ix].load(std::sync::atomic::Ordering::Relaxed);
+                    if val {
+                        Some(peptide)
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>();
 
-                info!(
-                    "found {} pre-filtered peptides for fasta chunk {}",
-                    peptides.len(),
-                    chunk_id,
-                );
-                peptides
-            })
-            .collect();
+            info!(
+                "found {} pre-filtered peptides for fasta chunk {}",
+                peptides.len(),
+                chunk_id,
+            );
+            all_peptides.extend(peptides);
+        }
 
         Parameters::reorder_peptides(&mut all_peptides);
-        all_peptides
+        Ok(all_peptides)
     }
 
     fn peptide_filter_processed_spectra(
@@ -345,7 +344,7 @@ impl Runner {
         chunk: &[Url],
         chunk_idx: usize,
         batch_size: usize,
-    ) -> Spectra {
+    ) -> anyhow::Result<Spectra> {
         // Read all of the spectra at once - this can help prevent memory over-consumption issues
         info!(
             "processing files {} .. {} ",
@@ -392,35 +391,36 @@ impl Runner {
                 self.requires_ms1(),
             );
 
-            match res {
-                Ok(s) => {
-                    log::trace!("- {}: read {} spectra", path, s.len());
-                    Ok(s)
-                }
-                Err(e) => {
-                    log::error!("- {}: {}", path, e);
-                    Err(e)
-                }
-            }
+            // An unreadable or truncated file must fail the run: silently searching the
+            // remaining files would report results that look complete but are not.
+            let s = res.with_context(|| format!("failed to read spectra from `{}`", path))?;
+            log::trace!("- {}: read {} spectra", path, s.len());
+            anyhow::Ok(s)
         };
 
         // Process each file's spectra as soon as that file is read, so the raw
         // (unfiltered) peak lists of only the files currently being read are alive,
         // not those of the whole batch (by default num_cpus/2 files).
-        let read_and_process = |item| -> (Vec<ProcessedSpectrum>, Vec<ProcessedSpectrum>) {
-            let Ok(raw) = inner_closure(item) else {
-                return Default::default();
-            };
+        let read_and_process = |item| -> anyhow::Result<Spectra> {
+            let raw = inner_closure(item)?;
             let (ms1, msn): (Vec<_>, Vec<_>) = raw.into_par_iter().partition(|s| s.ms_level == 1);
-            (
+            Ok((
                 ms1.into_par_iter().map(|s| sp.process(s)).collect(),
                 msn.into_par_iter().map(|s| sp.process(s)).collect(),
-            )
+            ))
         };
-        let per_file: Vec<_> = if file_serial_read {
-            chunk.iter().enumerate().map(read_and_process).collect()
+        let per_file = if file_serial_read {
+            chunk
+                .iter()
+                .enumerate()
+                .map(read_and_process)
+                .collect::<anyhow::Result<Vec<_>>>()?
         } else {
-            chunk.par_iter().enumerate().map(read_and_process).collect()
+            chunk
+                .par_iter()
+                .enumerate()
+                .map(read_and_process)
+                .collect::<anyhow::Result<Vec<_>>>()?
         };
         let (mut ms1_spectra, mut msn_spectra) = (Vec::new(), Vec::new());
         for (ms1, msn) in per_file {
@@ -431,7 +431,7 @@ impl Runner {
         let io_time = Instant::now() - start;
         info!("- file IO: {:8} ms", io_time.as_millis());
 
-        (ms1_spectra, msn_spectra)
+        Ok((ms1_spectra, msn_spectra))
     }
 
     fn batch_files(
@@ -439,19 +439,16 @@ impl Runner {
         scorer: &Scorer,
         batch_size: usize,
         mut first_batch: Option<Spectra>,
-    ) -> SageResults {
-        self.parameters
-            .mzml_paths
-            .chunks(batch_size)
-            .enumerate()
-            .map(|(chunk_idx, chunk)| {
-                let spectra = match first_batch.take() {
-                    Some(spectra) if chunk_idx == 0 => spectra,
-                    _ => self.read_processed_spectra(chunk, chunk_idx, batch_size),
-                };
-                self.process_chunk(scorer, spectra)
-            })
-            .collect::<SageResults>()
+    ) -> anyhow::Result<SageResults> {
+        let mut results = Vec::new();
+        for (chunk_idx, chunk) in self.parameters.mzml_paths.chunks(batch_size).enumerate() {
+            let spectra = match first_batch.take() {
+                Some(spectra) if chunk_idx == 0 => spectra,
+                _ => self.read_processed_spectra(chunk, chunk_idx, batch_size)?,
+            };
+            results.push(self.process_chunk(scorer, spectra));
+        }
+        Ok(results.into_iter().collect::<SageResults>())
     }
 
     pub fn run(mut self, parallel: usize, parquet: bool) -> anyhow::Result<telemetry::Telemetry> {
@@ -475,7 +472,7 @@ impl Runner {
 
         //Collect all results into a single container
         let first_batch = self.first_batch.take();
-        let mut outputs = self.batch_files(&scorer, parallel, first_batch);
+        let mut outputs = self.batch_files(&scorer, parallel, first_batch)?;
 
         let alignments = if self.parameters.predict_rt {
             // Poisson probability is usually the best single feature for refining FDR.

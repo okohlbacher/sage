@@ -145,9 +145,14 @@ impl MzMLReader {
             }};
         }
 
+        // A document whose `<mzML>` root is never closed is truncated (e.g. an incomplete
+        // download or a cut-off .mzML.gz); reading it as if complete would silently drop
+        // spectra. (Bare `<spectrum>` fragments without a root are accepted.)
+        let (mut root_opened, mut root_closed) = (false, false);
         loop {
             match reader.read_event_into_async(&mut buf).await {
                 Ok(Event::Start(ref ev)) => {
+                    root_opened |= ev.name().into_inner() == b"mzML";
                     // State transition into child tag
                     state = match (ev.name().into_inner(), state) {
                         (b"spectrum", _) => Some(State::Spectrum),
@@ -345,6 +350,7 @@ impl MzMLReader {
                     }
                 }
                 Ok(Event::End(ev)) => {
+                    root_closed |= ev.name().into_inner() == b"mzML";
                     state = match (state, ev.name().into_inner()) {
                         (Some(State::Binary), b"binary") => Some(State::BinaryDataArray),
                         (Some(State::BinaryDataArray), b"binaryDataArray") => Some(State::Spectrum),
@@ -393,11 +399,12 @@ impl MzMLReader {
                 }
                 Ok(Event::Eof) => break,
                 Ok(_) => {}
-                Err(err) => {
-                    log::error!("unhandled XML error while parsing mzML: {}", err)
-                }
+                Err(err) => return Err(err.into()),
             }
             buf.clear();
+        }
+        if root_opened && !root_closed {
+            return Err(MzMLError::Truncated(spectra.len()));
         }
         Ok(spectra)
     }
@@ -407,6 +414,8 @@ impl MzMLReader {
 pub enum MzMLError {
     #[error("malformed MzML")]
     Malformed,
+    #[error("truncated MzML: file ends before </mzML> (after {0} spectra)")]
+    Truncated(usize),
     #[error("unsupported cvParam {0}")]
     UnsupportedCV(String),
     #[error("XML parsing error: {0}")]
@@ -428,6 +437,34 @@ mod test {
     use sage_core::{mass::Tolerance, spectrum::Representation};
 
     use super::{MzMLError, MzMLReader};
+
+    #[tokio::test]
+    async fn truncated_file_is_an_error() {
+        let full = include_str!("../../../tests/LQSRPAAPPAPGPGQLTLR.mzML");
+        let complete = MzMLReader::with_file_id(0)
+            .parse(full.as_bytes())
+            .await
+            .unwrap();
+        assert_eq!(complete.len(), 1);
+
+        // cut in the header, inside the spectrum, and after it but before </mzML>
+        for cut in [
+            full.find("<run").unwrap(),
+            full.len() / 2,
+            full.find("</spectrumList>").unwrap(),
+        ] {
+            let result = MzMLReader::with_file_id(0)
+                .parse(full[..cut].as_bytes())
+                .await;
+            assert!(
+                matches!(
+                    result,
+                    Err(MzMLError::Truncated(_)) | Err(MzMLError::XMLError(_))
+                ),
+                "cut at {cut}: {result:?}"
+            );
+        }
+    }
 
     #[tokio::test]
     async fn parse_spectrum_issue_78() -> Result<(), MzMLError> {
