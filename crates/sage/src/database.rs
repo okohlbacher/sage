@@ -256,16 +256,15 @@ impl Parameters {
             })
             .collect::<Vec<_>>();
 
-        Self::reorder_peptides(&mut target_decoys);
+        // `digest` already removed decoys colliding with targets
+        Self::sort_and_dedup(&mut target_decoys);
 
         target_decoys
     }
 
+    /// Merge peptides from separately digested FASTA chunks (prefilter): drop decoys that
+    /// collide with a target, then sort and deduplicate.
     pub fn reorder_peptides(target_decoys: &mut Vec<Peptide>) {
-        log::trace!("sorting and deduplicating peptides");
-
-        let init_size = target_decoys.len();
-
         // A decoy with the sequence of a target must go, as in `digest`. With a
         // prefiltered database the chunks are digested separately, so a decoy from one
         // chunk can equal a target from another; merging them below used to append the
@@ -277,6 +276,12 @@ impl Parameters {
             .collect();
         target_decoys.retain(|p| !p.decoy || !targets.contains(&p.sequence));
         drop(targets);
+        Self::sort_and_dedup(target_decoys);
+    }
+
+    fn sort_and_dedup(target_decoys: &mut Vec<Peptide>) {
+        log::trace!("sorting and deduplicating peptides");
+        let init_size = target_decoys.len();
         // This is equivalent to a stable sort
         target_decoys.par_sort_unstable_by(|a, b| {
             a.monoisotopic
@@ -476,10 +481,12 @@ impl Parameters {
 fn advise_huge_pages<T>(buf: &mut [T]) {
     #[cfg(target_os = "linux")]
     {
-        const PAGE: usize = 4096;
+        // SAFETY: sysconf has no preconditions
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        let page = if page > 0 { page as usize } else { 4096 };
         let start = buf.as_mut_ptr() as usize;
         let end = start + std::mem::size_of_val(buf);
-        let aligned = (start + PAGE - 1) & !(PAGE - 1);
+        let aligned = (start + page - 1) & !(page - 1);
         if end > aligned {
             // SAFETY: the range lies inside `buf`'s allocation; MADV_HUGEPAGE only
             // changes how the kernel backs these pages, never their contents.

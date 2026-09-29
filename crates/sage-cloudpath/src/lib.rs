@@ -43,7 +43,8 @@ pub fn to_url(s: &str) -> Result<Url, Error> {
 
 /// Does the URL path end in "gz" or "gzip"?
 fn gzip_heuristic(url: &Url) -> bool {
-    let p = url.path();
+    // case-insensitive, like format detection (`run.mzML.GZ` was read as raw XML)
+    let p = url.path().to_ascii_lowercase();
     p.ends_with("gz") || p.ends_with("gzip")
 }
 
@@ -252,6 +253,7 @@ mod test {
     #[test]
     fn gzip_detection() {
         assert!(gzip_heuristic(&Url::parse("file:///file.mzML.gz").unwrap()));
+        assert!(gzip_heuristic(&Url::parse("file:///FILE.MZML.GZ").unwrap()));
         assert!(gzip_heuristic(
             &Url::parse("s3://bucket/file.mzML.gzip").unwrap()
         ));

@@ -11,13 +11,16 @@ pub struct Fasta {
     generate_decoys: bool,
 }
 
-/// First word of a header line (an empty header gives an empty accession, not a panic)
-fn accession(header: &str) -> String {
-    header
-        .split_ascii_whitespace()
-        .next()
-        .unwrap_or_default()
-        .to_string()
+/// First word of a header line. An empty header gets a unique placeholder: several
+/// anonymous records must not merge into one protein.
+fn accession(header: &str, record: usize) -> String {
+    match header.split_ascii_whitespace().next() {
+        Some(word) => word.to_string(),
+        None => {
+            log::warn!("FASTA record #{} has an empty header", record + 1);
+            format!("unnamed_protein_{}", record + 1)
+        }
+    }
 }
 
 /// Upper-case residues (lower case is used for soft masking) and drop a terminal stop
@@ -38,6 +41,7 @@ impl Fasta {
 
         let mut targets = Vec::new();
         let mut last_id = "";
+        let mut records = 0usize;
         let mut s = String::new();
 
         for line in contents.as_str().lines() {
@@ -47,7 +51,8 @@ impl Fasta {
             let line = line.trim();
             if let Some(id) = line.strip_prefix('>') {
                 if !s.is_empty() {
-                    let acc: Arc<str> = Arc::from(accession(last_id));
+                    let acc: Arc<str> = Arc::from(accession(last_id, records));
+                    records += 1;
                     let seq = clean(std::mem::take(&mut s));
                     if !acc.contains(&decoy_tag) || !generate_decoys {
                         targets.push((acc, seq));
@@ -60,7 +65,7 @@ impl Fasta {
         }
 
         if !s.is_empty() {
-            let acc: Arc<str> = Arc::from(accession(last_id));
+            let acc: Arc<str> = Arc::from(accession(last_id, records));
             if !acc.contains(&decoy_tag) || !generate_decoys {
                 targets.push((acc, clean(s)));
             }
@@ -120,8 +125,8 @@ mod test {
         );
         assert_eq!(fasta.targets[0].0.as_ref(), "sp|P1|A");
         assert_eq!(fasta.targets[0].1, "PEPTIDEKAAK");
-        // an empty header does not panic
-        assert_eq!(fasta.targets[1].0.as_ref(), "");
+        // an empty header does not panic and gets a unique name
+        assert_eq!(fasta.targets[1].0.as_ref(), "unnamed_protein_2");
         assert_eq!(fasta.targets[1].1, "MKR");
     }
 }

@@ -345,7 +345,11 @@ impl Runner {
     fn searchable(&self, spec: &ProcessedSpectrum) -> bool {
         spec.level == 2
             && spec.masses.len() >= self.parameters.min_peaks
-            && !spec.precursors.is_empty()
+            // e.g. MGF `PEPMASS=` (empty) or 0 gives m/z 0: nothing sensible to search
+            && spec
+                .precursors
+                .first()
+                .is_some_and(|p| p.mz.is_finite() && p.mz > 0.0)
     }
 
     fn read_processed_spectra(
@@ -439,7 +443,13 @@ impl Runner {
 
         let no_precursor = msn_spectra
             .iter()
-            .filter(|s| s.level == 2 && s.precursors.is_empty())
+            .filter(|s| {
+                s.level == 2
+                    && !s
+                        .precursors
+                        .first()
+                        .is_some_and(|p| p.mz.is_finite() && p.mz > 0.0)
+            })
             .count();
         if no_precursor > 0 {
             log::warn!(
@@ -1346,7 +1356,7 @@ impl Runner {
                     }) {
                         accuracies.push(feature.delta_mass);
                     }
-                    accuracies.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                    accuracies.sort_by(|a, b| a.total_cmp(b));
                     let mid = accuracies.len() / 2;
 
                     if accuracies.is_empty() {
@@ -1377,7 +1387,7 @@ impl Runner {
                     }) {
                         accuracies.push(feature.average_ppm);
                     }
-                    accuracies.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                    accuracies.sort_by(|a, b| a.total_cmp(b));
                     let mid = accuracies.len() / 2;
 
                     if accuracies.is_empty() {
@@ -1408,7 +1418,7 @@ impl Runner {
                     }) {
                         deviations.push(feature.delta_rt_model);
                     }
-                    deviations.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                    deviations.sort_by(|a, b| a.total_cmp(b));
                     let mid = deviations.len() / 2;
 
                     if deviations.is_empty() {
@@ -1439,7 +1449,7 @@ impl Runner {
                     }) {
                         deviations.push(feature.delta_ims_model);
                     }
-                    deviations.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                    deviations.sort_by(|a, b| a.total_cmp(b));
                     let mid = deviations.len() / 2;
 
                     if deviations.is_empty() {

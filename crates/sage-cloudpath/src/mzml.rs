@@ -451,6 +451,13 @@ impl MzMLReader {
                                 };
                                 spectrum.precursors.push(precursor);
                                 precursor = Precursor::default();
+                            } else {
+                                // not pushed: its charge/intensity/ref must not leak into the
+                                // next precursor; keep scan-level ion mobility
+                                precursor = Precursor {
+                                    inverse_ion_mobility: precursor.inverse_ion_mobility,
+                                    ..Default::default()
+                                };
                             }
                             Some(State::Spectrum)
                         }
