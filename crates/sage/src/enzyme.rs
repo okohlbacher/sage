@@ -1,4 +1,5 @@
 use fnv::FnvHashSet;
+use rayon::prelude::*;
 use regex::Regex;
 use std::sync::Arc;
 
@@ -32,11 +33,18 @@ pub struct DigestGroup {
 
 pub fn group_digests(mut digests: Vec<Digest>) -> Vec<DigestGroup> {
     let mut groups = Vec::new();
-    digests.sort_unstable_by(|a, b| {
+    // Grouping only needs (position, decoy, sequence); the remaining keys make the
+    // order total, so the group's reference digest (and its semi-enzymatic /
+    // missed-cleavage flags) no longer depends on input order. Parallel: this sort
+    // was a serial 1.4 s step of the database build for human tryptic.
+    digests.par_sort_unstable_by(|a, b| {
         a.position
             .cmp(&b.position)
             .then(a.decoy.cmp(&b.decoy))
             .then(a.sequence.cmp(&b.sequence))
+            .then(a.semi_enzymatic.cmp(&b.semi_enzymatic))
+            .then(a.missed_cleavages.cmp(&b.missed_cleavages))
+            .then(a.protein.cmp(&b.protein))
     });
     let mut curr_group = DigestGroup {
         reference: digests[0].clone(),
@@ -57,6 +65,7 @@ pub fn group_digests(mut digests: Vec<Digest>) -> Vec<DigestGroup> {
             };
         }
     }
+    curr_group.proteins.sort_unstable();
     groups.push(curr_group);
     groups
 }
@@ -346,6 +355,45 @@ impl EnzymeParameters {
 mod test {
     use quickcheck_macros::quickcheck;
     use std::collections::HashSet;
+
+    #[test]
+    fn group_digests_independent_of_input_order() {
+        let digest = |sequence: &str, protein: &str, missed_cleavages, semi_enzymatic| Digest {
+            decoy: false,
+            semi_enzymatic,
+            sequence: sequence.into(),
+            protein: protein.into(),
+            missed_cleavages,
+            position: Position::Internal,
+        };
+        let digests = vec![
+            digest("PEPTIDEK", "P2", 1, false),
+            digest("PEPTIDEK", "P1", 0, true),
+            digest("PEPTIDEK", "P3", 0, false),
+            digest("AAAK", "P1", 0, false),
+        ];
+        let summary = |groups: Vec<DigestGroup>| {
+            groups
+                .into_iter()
+                .map(|g| {
+                    (
+                        g.reference.sequence,
+                        g.reference.protein.to_string(),
+                        g.reference.missed_cleavages,
+                        g.reference.semi_enzymatic,
+                        g.proteins.iter().map(|p| p.to_string()).collect::<Vec<_>>(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let forward = summary(group_digests(digests.clone()));
+        let reversed = summary(group_digests(digests.into_iter().rev().collect()));
+        assert_eq!(forward, reversed);
+        assert_eq!(forward.len(), 2);
+        // total order picks the non-semi, fewest-missed-cleavage, first protein
+        assert_eq!(forward[1].1, "P3");
+        assert_eq!(forward[1].4, vec!["P1", "P2", "P3"]);
+    }
 
     use super::*;
 
