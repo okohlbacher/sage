@@ -5,12 +5,13 @@ use crate::mass::Tolerance;
 use crate::modification::{validate_mods, validate_var_mods, ModificationSpecificity, VarModEntry};
 use crate::peptide::Peptide;
 use dashmap::DashSet;
-use fnv::FnvBuildHasher;
+use fnv::{FnvBuildHasher, FnvHashSet};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::hash::Hash;
+use std::sync::Arc;
 
 #[derive(Deserialize, Serialize, Clone, Debug)]
 pub struct EnzymeBuilder {
@@ -264,6 +265,18 @@ impl Parameters {
         log::trace!("sorting and deduplicating peptides");
 
         let init_size = target_decoys.len();
+
+        // A decoy with the sequence of a target must go, as in `digest`. With a
+        // prefiltered database the chunks are digested separately, so a decoy from one
+        // chunk can equal a target from another; merging them below used to append the
+        // decoy's (unrelated) proteins to the target and destroy its uniqueness.
+        let targets: FnvHashSet<Arc<[u8]>> = target_decoys
+            .iter()
+            .filter(|p| !p.decoy)
+            .map(|p| p.sequence.clone())
+            .collect();
+        target_decoys.retain(|p| !p.decoy || !targets.contains(&p.sequence));
+        drop(targets);
         // This is equivalent to a stable sort
         target_decoys.par_sort_unstable_by(|a, b| {
             a.monoisotopic
@@ -747,6 +760,25 @@ mod test {
         assert!(k_entries[1].is_object());
         assert!(k_entries[1].get("max_count").is_none());
         assert!(serialized["variable_mods"]["M"][0].is_number());
+    }
+
+    #[test]
+    fn decoy_colliding_with_target_is_dropped_not_merged() {
+        let peptide = |protein: &str, decoy| {
+            Peptide::try_from(crate::enzyme::Digest {
+                decoy,
+                sequence: "AELDWGK".into(),
+                protein: protein.into(),
+                ..Default::default()
+            })
+            .unwrap()
+        };
+        // e.g. the target from one prefilter chunk and a decoy from another
+        let mut peptides = vec![peptide("P2", true), peptide("P1", false)];
+        Parameters::reorder_peptides(&mut peptides);
+        assert_eq!(peptides.len(), 1);
+        assert!(!peptides[0].decoy);
+        assert_eq!(peptides[0].proteins, vec![Arc::from("P1")]);
     }
 
     #[test]
