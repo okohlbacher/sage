@@ -19,6 +19,7 @@ name = "sage"
 path = "src/main.rs"
 
 [dependencies]
+mimalloc = { version = "0.1", default-features = false }
 sage-core = { path = "../sage" }
 sage-cloudpath = { path = "../sage-cloudpath", features = ["parquet"] }
 

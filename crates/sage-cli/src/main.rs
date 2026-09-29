@@ -1,3 +1,6 @@
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use clap::{value_parser, Arg, Command, ValueHint};
 use rayon::ThreadPoolBuilder;
 use sage_cli::input::Input;
