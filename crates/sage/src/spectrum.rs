@@ -444,23 +444,28 @@ impl SpectrumProcessor {
             .as_ref()
             .is_some_and(|m| m.len() != spectrum.mz.len());
         // Non-finite peaks (corrupt arrays) would poison sorting and matching
-        if spectrum.mobility.is_none()
+        if !mobility_mismatch
+            && spectrum.mz.len() == spectrum.intensity.len()
             && spectrum
                 .mz
                 .iter()
                 .zip(&spectrum.intensity)
                 .any(|(mz, int)| !mz.is_finite() || !int.is_finite())
-            && spectrum.mz.len() == spectrum.intensity.len()
         {
-            let (mz, intensity): (Vec<f32>, Vec<f32>) = spectrum
+            let keep = spectrum
                 .mz
                 .iter()
                 .zip(&spectrum.intensity)
-                .filter(|(mz, int)| mz.is_finite() && int.is_finite())
-                .map(|(mz, int)| (*mz, *int))
-                .unzip();
-            spectrum.mz = mz;
-            spectrum.intensity = intensity;
+                .map(|(mz, int)| mz.is_finite() && int.is_finite())
+                .collect::<Vec<_>>();
+            let mut ix = 0..;
+            spectrum.mz.retain(|_| keep[ix.next().unwrap()]);
+            let mut ix = 0..;
+            spectrum.intensity.retain(|_| keep[ix.next().unwrap()]);
+            if let Some(mobility) = spectrum.mobility.as_mut() {
+                let mut ix = 0..;
+                mobility.retain(|_| keep[ix.next().unwrap()]);
+            }
         }
         if spectrum.mz.len() != spectrum.intensity.len() || mobility_mismatch {
             warn_once(&LENGTH_WARNED, || {
@@ -558,6 +563,16 @@ mod test {
             vec![1.0, 1.0, f32::INFINITY],
         ));
         assert_eq!(nan.masses.len(), 1);
+        // ... also in spectra with a mobility array (Bruker)
+        let mut raw = ms2(
+            Representation::Centroid,
+            vec![100.0, f32::NAN, 300.0],
+            vec![1.0, 1.0, f32::INFINITY],
+        );
+        raw.mobility = Some(vec![0.9; 3]);
+        let nan = sp.process(raw);
+        assert_eq!(nan.masses.len(), 1);
+        assert!(nan.masses.iter().all(|m| m.is_finite()));
 
         // intensity array shorter than m/z: used to index out of bounds in deisotoping
         let short = sp.process(ms2(Representation::Centroid, peaks, vec![1.0; 2]));

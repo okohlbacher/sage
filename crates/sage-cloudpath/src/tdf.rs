@@ -102,7 +102,10 @@ impl TdfReader {
                     }
                     // a frame that cannot be read fails the file (it used to be logged and
                     // dropped, so a corrupt .d was searched partially without failing)
-                    Err(x) => Err(x),
+                    Err(x) => {
+                        log::error!("cannot read an MS1 frame: {}", x);
+                        Err(x)
+                    }
                 },
             )
             .collect::<Result<_, _>>()?;
@@ -149,7 +152,10 @@ impl TdfReader {
                     None => None,
                 }),
                 // a spectrum that cannot be read fails the file instead of being dropped
-                Err(e) => Err(e),
+                Err(e) => {
+                    log::error!("cannot read MS2 spectrum {}: {}", index, e);
+                    Err(e)
+                }
             })
             .collect::<Result<Vec<_>, _>>()?
             .into_iter()

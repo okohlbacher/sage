@@ -28,6 +28,21 @@ pub fn predict(db: &IndexedDatabase, features: &mut [Feature]) -> Option<()> {
 
         feat.delta_ims_model = (feat.ims - bounded).abs();
     });
+    // PSMs without a measured mobility (mzML/MGF next to .d files) have no residual; give
+    // them the median residual of the others, as for RT
+    let mut deltas = features
+        .iter()
+        .filter(|f| f.ims > 0.0)
+        .map(|f| f.delta_ims_model)
+        .collect::<Vec<_>>();
+    if deltas.len() < features.len() && !deltas.is_empty() {
+        let mid = deltas.len() / 2;
+        let median = *deltas.select_nth_unstable_by(mid, f32::total_cmp).1;
+        features
+            .par_iter_mut()
+            .filter(|f| !(f.ims > 0.0))
+            .for_each(|f| f.delta_ims_model = median);
+    }
     Some(())
 }
 pub struct MobilityModel {
@@ -158,7 +173,8 @@ impl MobilityModel {
 
         let lr = LinearRegression::fit::<_, FEATURES>(
             training_set,
-            |feat| feat.label == 1 && feat.spectrum_q <= 0.01,
+            // PSMs without a measured mobility must not train the model on zeros
+            |feat| feat.label == 1 && feat.spectrum_q <= 0.01 && feat.ims > 0.0,
             |psm| Self::embed(&db[psm.peptide_idx], &psm.charge, &map),
             |psm| psm.ims as f64,
         )?;
@@ -184,6 +200,46 @@ impl MobilityModel {
 mod test {
     use super::*;
     use crate::enzyme::Digest;
+
+    #[test]
+    fn psms_without_mobility_do_not_train_the_model() {
+        let fasta = crate::fasta::Fasta::parse(
+            include_str!("../../../../tests/Q99536.fasta").into(),
+            "rev_",
+            true,
+        );
+        let mut builder = crate::database::Builder::default();
+        builder.update_fasta("unused".into());
+        let db = builder.make_parameters().build(fasta);
+        let psm = |ix: usize, ims: f32| Feature {
+            peptide_idx: crate::database::PeptideIx(ix as u32),
+            charge: 2,
+            label: 1,
+            ims,
+            ..Default::default()
+        };
+        // mobility roughly proportional to length: something the model can fit
+        let with_ims = (0..db.peptides.len())
+            .filter(|&ix| !db.peptides[ix].decoy)
+            .map(|ix| psm(ix, 0.6 + db.peptides[ix].sequence.len() as f32 * 0.02))
+            .collect::<Vec<_>>();
+        let mut alone = with_ims.clone();
+        predict(&db, &mut alone).unwrap();
+
+        // same PSMs next to PSMs of a file without mobility
+        let mut mixed = with_ims.clone();
+        mixed.extend(with_ims.iter().map(|f| psm(f.peptide_idx.0 as usize, 0.0)));
+        predict(&db, &mut mixed).unwrap();
+        for (a, m) in alone.iter().zip(&mixed) {
+            assert_eq!(a.delta_ims_model, m.delta_ims_model);
+        }
+        // mobility-less PSMs get a neutral (median) residual, not |0 - predicted|
+        let median = mixed[with_ims.len()].delta_ims_model;
+        assert!(median < 0.5, "{median}");
+        assert!(mixed[with_ims.len()..]
+            .iter()
+            .all(|f| f.delta_ims_model == median));
+    }
 
     #[test]
     fn test_feature_embed() {

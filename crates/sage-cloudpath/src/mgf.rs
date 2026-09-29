@@ -352,7 +352,11 @@ impl MgfReader {
         // embedded parameters
         while !default_params.is_query_start {
             let Some(line) = lines.next() else {
-                // no `BEGIN IONS` at all (e.g. an empty file)
+                // no `BEGIN IONS` at all: an empty file, a header-only export, or not
+                // an MGF file at all
+                if !contents.trim().is_empty() {
+                    log::warn!("MGF file has content but no BEGIN IONS block: no spectra read");
+                }
                 return Ok(Vec::new());
             };
             let line = line.trim();
