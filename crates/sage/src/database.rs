@@ -47,8 +47,14 @@ impl From<EnzymeBuilder> for EnzymeParameters {
             min_len: en.min_len.unwrap_or(5),
             max_len: en.max_len.unwrap_or(50),
             enzyme: Enzyme::new(
-                &en.cleave_at.unwrap_or_else(|| "KR".into()),
-                &en.restrict.unwrap_or_else(|| "".into()),
+                &en.cleave_at.clone().unwrap_or_else(|| "KR".into()),
+                // An omitted `restrict` means no restriction for a custom `cleave_at`, but
+                // when `cleave_at` is omitted too the enzyme is trypsin, whose rule is "not
+                // before P" (DOCS.md). `{"missed_cleavages": 2}` used to drop that rule.
+                &en.restrict.unwrap_or_else(|| match en.cleave_at {
+                    None => "P".into(),
+                    Some(_) => "".into(),
+                }),
                 en.c_terminal.unwrap_or(true),
                 en.semi_enzymatic.unwrap_or(false),
             ),

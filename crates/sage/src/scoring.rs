@@ -14,7 +14,7 @@ pub enum ScoreType {
 }
 
 /// Structure to hold temporary scores
-#[derive(Copy, Clone, Default, Debug, PartialEq, PartialOrd)]
+#[derive(Copy, Clone, Default, Debug, PartialEq)]
 struct Score {
     peptide: PeptideIx,
     matched_b: u16,
@@ -30,6 +30,15 @@ struct Score {
 }
 
 impl Eq for Score {}
+
+// Must agree with `Ord`: `bounded_min_heapify` compares with `<`/`>`, i.e. `PartialOrd`.
+// A derived `PartialOrd` compared `peptide` (the first field) instead of hyperscore, so the
+// low-memory prefilter kept the candidates with the highest peptide index, not the best.
+impl PartialOrd for Score {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
 
 impl Ord for Score {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
@@ -513,12 +522,13 @@ impl<'db> Scorer<'db> {
             self.trim_hits(&mut hits);
             hits
         } else {
+            // a single isotope window: `isotope_errors: [n, n]` must search window n
             self.matched_peaks_with_isotope(
                 query,
                 precursor_mass,
                 precursor_charge,
                 precursor_tol,
-                0,
+                self.min_isotope_err,
             )
         }
     }
@@ -997,7 +1007,7 @@ mod tests {
             (Tolerance::Da(-1.5, 1.5), Tolerance::Ppm(-20.0, 20.0)),
             (Tolerance::Ppm(-50.0, 20.0), Tolerance::Da(-0.02, 0.02)),
         ] {
-            for (min_iso, max_iso) in [(-1, 3), (0, 2), (0, 1)] {
+            for (min_iso, max_iso) in [(-1, 3), (0, 2), (0, 1), (1, 1)] {
                 let scorer = Scorer {
                     db: &db,
                     precursor_tol,
@@ -1027,8 +1037,38 @@ mod tests {
                 assert_eq!(fused.matched_peaks, expected.matched_peaks);
                 assert_eq!(fused.scored_candidates, expected.scored_candidates);
                 assert_eq!(fused.preliminary, expected.preliminary);
+
+                // what the scorer actually runs (single window: `isotope_errors [n, n]`)
+                let mut actual = scorer.matched_peaks(&query, precursor_mass, 2, precursor_tol);
+                let mut expected = expected.preliminary;
+                actual.preliminary.sort();
+                expected.sort();
+                assert_eq!(
+                    actual.preliminary, expected,
+                    "isotopes {min_iso}..={max_iso}"
+                );
             }
         }
+    }
+
+    #[test]
+    fn score_heap_keeps_best_hyperscores() {
+        let score = |peptide, hyperscore| Score {
+            peptide: PeptideIx(peptide),
+            hyperscore,
+            ..Default::default()
+        };
+        // best hyperscore at the lowest peptide index
+        let mut scores = vec![
+            score(0, 50.0),
+            score(1, 10.0),
+            score(2, 5.0),
+            score(3, 20.0),
+        ];
+        bounded_min_heapify(&mut scores, 2);
+        let mut kept = scores[..2].iter().map(|s| s.peptide.0).collect::<Vec<_>>();
+        kept.sort();
+        assert_eq!(kept, vec![0, 3]);
     }
 
     #[test]

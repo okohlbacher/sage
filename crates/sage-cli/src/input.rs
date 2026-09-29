@@ -433,6 +433,15 @@ mod test {
         }
         assert_eq!(c.enzyme.map(|e| e.skip_suffix), Some([false; 26]));
 
+        // default trypsin (no `cleave_at`) keeps its proline rule in a partial block
+        let d: EnzymeParameters = serde_json::from_value::<EnzymeBuilder>(serde_json::json!({
+            "missed_cleavages": 2,
+        }))?
+        .into();
+        let mut trypsin = [false; 26];
+        trypsin[(b'P' - b'A') as usize] = true;
+        assert_eq!(d.enzyme.map(|e| e.skip_suffix), Some(trypsin));
+
         Ok(())
     }
 }
