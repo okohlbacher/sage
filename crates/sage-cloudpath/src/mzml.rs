@@ -143,6 +143,7 @@ impl MzMLReader {
 
         let mut spectrum = RawSpectrum::default_with_file_id(self.file_id);
         let mut precursor = Precursor::default();
+        let mut scan_mobility: Option<f32> = None;
         let mut iso_window_lo: Option<f32> = None;
         let mut iso_window_hi: Option<f32> = None;
         let mut spectra = Vec::new();
@@ -282,7 +283,8 @@ impl MzMLReader {
                                 spectrum.ion_injection_time = extract_value!(ev);
                             }
                             INVERSE_ION_MOBILITY => {
-                                precursor.inverse_ion_mobility = Some(extract_value!(ev));
+                                // scan-level mobility applies to every precursor of the spectrum
+                                scan_mobility = Some(extract_value!(ev));
                             }
                             _ => {}
                         }
@@ -340,6 +342,7 @@ impl MzMLReader {
                             spectrum.id = id.to_string();
                             // nothing may leak from the previous spectrum
                             precursor = Precursor::default();
+                            scan_mobility = None;
                             iso_window_lo = None;
                             iso_window_hi = None;
                             noise_array.clear();
@@ -350,6 +353,9 @@ impl MzMLReader {
                             binary_array = None;
                         }
                         b"precursor" => {
+                            // nothing from a previous precursor of this spectrum may leak
+                            iso_window_lo = None;
+                            iso_window_hi = None;
                             // Not all precursor fields have a spectrumRef
                             if let Some(scan) = ev.try_get_attribute(b"spectrumRef")? {
                                 let scan = std::str::from_utf8(&scan.value)?;
@@ -460,16 +466,12 @@ impl MzMLReader {
                                     (Some(lo), Some(hi)) => Some(Tolerance::Da(-lo, hi)),
                                     _ => None,
                                 };
+                                precursor.inverse_ion_mobility =
+                                    precursor.inverse_ion_mobility.or(scan_mobility);
                                 spectrum.precursors.push(precursor);
-                                precursor = Precursor::default();
-                            } else {
-                                // not pushed: its charge/intensity/ref must not leak into the
-                                // next precursor; keep scan-level ion mobility
-                                precursor = Precursor {
-                                    inverse_ion_mobility: precursor.inverse_ion_mobility,
-                                    ..Default::default()
-                                };
                             }
+                            // a precursor that was not pushed must not leak into the next one
+                            precursor = Precursor::default();
                             Some(State::Spectrum)
                         }
                         (Some(State::Scan), b"scan") => Some(State::Spectrum),
@@ -864,6 +866,47 @@ mod test {
         assert!((s.scan_start_time - 25.066).abs() < 0.0001);
         assert_eq!(s.ion_injection_time, 0.0);
         assert_eq!(s.intensity.len(), s.mz.len());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn scan_mobility_and_windows_per_precursor() -> Result<(), MzMLError> {
+        // scan-level mobility applies to every precursor; an isolation window of the first
+        // precursor must not leak into the second
+        let ion = |mz: &str| {
+            format!(
+                r#"<selectedIonList count="1"><selectedIon>
+                <cvParam cvRef="MS" accession="MS:1000744" name="selected ion m/z" value="{mz}"/>
+                </selectedIon></selectedIonList>"#
+            )
+        };
+        let s = format!(
+            r#"<spectrum id="s=1" index="0" defaultArrayLength="0">
+            <cvParam cvRef="MS" accession="MS:1000127" name="centroid spectrum"/>
+            <cvParam cvRef="MS" accession="MS:1000511" name="ms level" value="2"/>
+            <scanList count="1"><scan>
+            <cvParam cvRef="MS" accession="MS:1000016" name="scan start time" value="60" unitAccession="UO:0000010" unitName="second" unitCvRef="UO"/>
+            <cvParam cvRef="MS" accession="MS:1002815" name="inverse reduced ion mobility" value="0.9"/>
+            </scan></scanList>
+            <precursorList count="2">
+            <precursor><isolationWindow>
+            <cvParam cvRef="MS" accession="MS:1000827" name="isolation window target m/z" value="500"/>
+            <cvParam cvRef="MS" accession="MS:1000828" name="isolation window lower offset" value="1.5"/>
+            <cvParam cvRef="MS" accession="MS:1000829" name="isolation window upper offset" value="0.75"/>
+            </isolationWindow>{}</precursor>
+            <precursor>{}</precursor>
+            </precursorList>
+            </spectrum>"#,
+            ion("500"),
+            ion("600")
+        );
+        let spectra = MzMLReader::with_file_id(0).parse(s.as_bytes()).await?;
+        let p = &spectra[0].precursors;
+        assert_eq!(p.len(), 2);
+        assert_eq!(p[0].isolation_window, Some(Tolerance::Da(-1.5, 0.75)));
+        assert_eq!(p[1].isolation_window, None);
+        assert_eq!(p[0].inverse_ion_mobility, Some(0.9));
+        assert_eq!(p[1].inverse_ion_mobility, Some(0.9));
         Ok(())
     }
 

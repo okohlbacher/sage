@@ -1601,10 +1601,13 @@ impl Runner {
             // Extract sage_discriminant_score and label from features
             let (scores, labels): (Vec<f64>, Vec<i32>) = features
                 .iter()
+                .filter(|f| f.discriminant_score.is_finite())
                 .map(|f| (f.discriminant_score as f64, f.label))
                 .unzip();
+            // report_builder's P-P plot unwraps on NaN and on a missing class
+            let both_classes = labels.contains(&1) && labels.contains(&-1);
 
-            if !scores.is_empty() && scores.len() > 100 {
+            if scores.len() > 100 && both_classes {
                 let score_histogram =
                     plot_score_histogram(&scores, &labels, "LDA Score", "Score").unwrap();
 

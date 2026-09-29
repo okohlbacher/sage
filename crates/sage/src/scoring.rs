@@ -384,6 +384,8 @@ impl<'db> Scorer<'db> {
             }
         }
         if hits.matched_peaks == 0 {
+            // no candidate matched: don't hand the dense (all-empty) array to the caller
+            hits.preliminary = Vec::new();
             return hits;
         }
 
@@ -428,24 +430,18 @@ impl<'db> Scorer<'db> {
                     idx_hi: query.pre_idx_hi,
                     mass_lo,
                     mass_hi,
-                    hits: InitialHits {
-                        matched_peaks: 0,
-                        scored_candidates: 0,
-                        preliminary: vec![
-                            PreScore::default();
-                            query.pre_idx_hi - query.pre_idx_lo + 1
-                        ],
-                    },
+                    hits: InitialHits::default(),
                 }
             })
             .collect::<Vec<_>>();
         // All windows' dense candidate arrays are alive at once here, versus one at a time
         // in the per-window path. For very wide (Da) precursor windows that can be GBs
         // per thread, so fall back to one window at a time above ~4 M candidates.
+        // Decided before allocating anything.
         const MAX_FUSED_CANDIDATES: usize = 1 << 22;
         if windows
             .iter()
-            .map(|w| w.hits.preliminary.len())
+            .map(|w| w.idx_hi - w.idx_lo + 1)
             .sum::<usize>()
             > MAX_FUSED_CANDIDATES
         {
@@ -463,6 +459,9 @@ impl<'db> Scorer<'db> {
                     hits
                 },
             );
+        }
+        for w in windows.iter_mut() {
+            w.hits.preliminary = vec![PreScore::default(); w.idx_hi - w.idx_lo + 1];
         }
         let union_lo = windows.iter().map(|w| w.idx_lo).min().unwrap_or_default();
         let union_hi = windows.iter().map(|w| w.idx_hi).max().unwrap_or_default();
@@ -517,6 +516,8 @@ impl<'db> Scorer<'db> {
             .fold(InitialHits::default(), |mut acc, mut w| {
                 if w.hits.matched_peaks > 0 {
                     self.trim_hits(&mut w.hits);
+                } else {
+                    w.hits.preliminary = Vec::new();
                 }
                 acc += w.hits;
                 acc
@@ -1115,6 +1116,13 @@ mod tests {
                     actual.preliminary, expected,
                     "isotopes {min_iso}..={max_iso}"
                 );
+
+                // no fragment matches: no dense all-empty candidate array is returned
+                let mut empty = query.clone();
+                empty.masses.clear();
+                let none = scorer.matched_peaks(&empty, precursor_mass, charge, precursor_tol);
+                assert_eq!(none.matched_peaks, 0);
+                assert!(none.preliminary.is_empty());
             }
         }
     }

@@ -33,7 +33,7 @@ pub fn predict(db: &IndexedDatabase, features: &mut [Feature]) -> Option<()> {
         let median = *deltas.select_nth_unstable_by(mid, f32::total_cmp).1;
         features
             .par_iter_mut()
-            .filter(|f| f.rt <= 0.0)
+            .filter(|f| !(f.rt > 0.0))
             .for_each(|f| f.delta_rt_model = median);
     }
     Some(())

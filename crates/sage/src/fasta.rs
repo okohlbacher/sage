@@ -18,10 +18,12 @@ fn accession(header: &str, record: usize) -> String {
         Some(word) => word.to_string(),
         None => {
             log::warn!("FASTA record #{} has an empty header", record + 1);
-            format!("unnamed_protein_{}", record + 1)
+            format!("{}{}", PLACEHOLDER, record + 1)
         }
     }
 }
+
+const PLACEHOLDER: &str = "unnamed_protein_";
 
 /// Upper-case residues (lower case is used for soft masking) and drop a terminal stop
 /// codon (`*`, e.g. translated/Ensembl FASTAs). Anything else that is not a residue
@@ -42,6 +44,8 @@ impl Fasta {
         let mut targets = Vec::new();
         let mut last_id = "";
         let mut records = 0usize;
+        // indices into `targets` of records named by a placeholder (empty header)
+        let mut placeholders = Vec::new();
         let mut s = String::new();
 
         for line in contents.as_str().lines() {
@@ -55,6 +59,9 @@ impl Fasta {
                     records += 1;
                     let seq = clean(std::mem::take(&mut s));
                     if !acc.contains(&decoy_tag) || !generate_decoys {
+                        if acc.starts_with(PLACEHOLDER) && last_id.trim().is_empty() {
+                            placeholders.push(targets.len());
+                        }
                         targets.push((acc, seq));
                     }
                 }
@@ -67,7 +74,30 @@ impl Fasta {
         if !s.is_empty() {
             let acc: Arc<str> = Arc::from(accession(last_id, records));
             if !acc.contains(&decoy_tag) || !generate_decoys {
+                if acc.starts_with(PLACEHOLDER) && last_id.trim().is_empty() {
+                    placeholders.push(targets.len());
+                }
                 targets.push((acc, clean(s)));
+            }
+        }
+
+        // placeholder names must not collide with explicit accessions (a record may be
+        // called `unnamed_protein_2`); rename colliding placeholders
+        // ponytail: a decoy tag occurring inside the placeholder text (e.g. "unnamed_")
+        // is not handled; such a tag is not realistic.
+        if !placeholders.is_empty() {
+            let explicit = targets
+                .iter()
+                .enumerate()
+                .filter(|(ix, _)| !placeholders.contains(ix))
+                .map(|(_, (acc, _))| acc.clone())
+                .collect::<std::collections::HashSet<_>>();
+            for &ix in &placeholders {
+                let mut name = targets[ix].0.to_string();
+                while explicit.contains(name.as_str()) {
+                    name.push('_');
+                }
+                targets[ix].0 = Arc::from(name);
             }
         }
 
@@ -127,6 +157,15 @@ mod test {
         assert_eq!(fasta.targets[0].1, "PEPTIDEKAAK");
         // an empty header does not panic and gets a unique name
         assert_eq!(fasta.targets[1].0.as_ref(), "unnamed_protein_2");
+
+        // ... also when an explicit accession already uses that name
+        let clash = Fasta::parse(
+            ">unnamed_protein_2\nPEPTIDEK\n>\nAAAAAAAK\n".into(),
+            "rev_",
+            false,
+        );
+        assert_eq!(clash.targets.len(), 2);
+        assert_ne!(clash.targets[0].0, clash.targets[1].0);
         assert_eq!(fasta.targets[1].1, "MKR");
     }
 }

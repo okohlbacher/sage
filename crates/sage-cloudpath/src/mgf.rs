@@ -293,8 +293,13 @@ impl QueryParser {
                 }
             }
             if let Some(intensity_str) = mz_intensity.next() {
-                if let Ok(intensity) = intensity_str.parse::<f32>() {
-                    query_data.ion_intensity_array.push(intensity);
+                match intensity_str.parse::<f32>() {
+                    Ok(intensity) => query_data.ion_intensity_array.push(intensity),
+                    Err(_) => {
+                        return Err(MgfError::Malformed {
+                            location: *Location::caller(),
+                        })
+                    }
                 }
             } else {
                 query_data.ion_intensity_array.push(1.0)
@@ -362,6 +367,8 @@ impl MgfReader {
         }
 
         let mut query_data = QueryData::default_with_params(default_params);
+        // file-level defaults (CHARGE, TOL, ...) apply to the first spectrum too
+        query_data.init();
 
         // query. Errors fail the file: printing them and continuing returned the rest of a
         // corrupt file as if it were complete.
@@ -371,9 +378,19 @@ impl MgfReader {
                 continue;
             }
             let line = line.trim();
+            let malformed = || MgfError::Malformed {
+                location: *Location::caller(),
+            };
             if line.starts_with("BEGIN IONS") {
+                if in_block {
+                    // nested block: END IONS missing, spectra would be merged
+                    return Err(malformed());
+                }
                 in_block = true;
             } else if line.starts_with("END IONS") {
+                if !in_block {
+                    return Err(malformed());
+                }
                 in_block = false;
             }
             for parser in &query_parsers {
@@ -452,6 +469,27 @@ mod test {
         // corrupt peak line inside a block
         let corrupt = ok.replace("100.1 5", "10x0.1 5");
         assert!(MgfReader::with_file_id(0).parse(corrupt).is_err());
+        // corrupt intensity
+        let corrupt = ok.replace("100.1 5", "100.1 5x");
+        assert!(MgfReader::with_file_id(0).parse(corrupt).is_err());
+        // missing END IONS: the next block would be merged into this one
+        let nested = format!("{}{ok}", ok.replace("END IONS\n", ""));
+        assert!(MgfReader::with_file_id(0).parse(nested).is_err());
+        // END IONS without a block
+        assert!(MgfReader::with_file_id(0)
+            .parse(format!("{ok}END IONS\n"))
+            .is_err());
+    }
+
+    #[test]
+    fn file_level_charges_apply_to_the_first_spectrum() {
+        let block = "BEGIN IONS\nTITLE=a\nPEPMASS=500.25\n100.1 5\n200.2 7\nEND IONS\n";
+        let mgf = format!("CHARGE=5+ and 6+\n{block}{block}");
+        let spectra = MgfReader::with_file_id(0).parse(mgf).unwrap();
+        for s in &spectra {
+            let charges = s.precursors.iter().map(|p| p.charge).collect::<Vec<_>>();
+            assert_eq!(charges, [Some(5), Some(6)]);
+        }
     }
 
     #[test]
