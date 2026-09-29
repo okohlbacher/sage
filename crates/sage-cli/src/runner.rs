@@ -25,10 +25,15 @@ use report_builder::{
     Report, ReportSection,
 };
 
+/// Processed (MS1, MSn) spectra of one batch of files
+type Spectra = (Vec<ProcessedSpectrum>, Vec<ProcessedSpectrum>);
+
 pub struct Runner {
     pub database: IndexedDatabase,
     pub parameters: Search,
     start: Instant,
+    /// First batch of spectra, read while the database was being built
+    first_batch: Option<Spectra>,
 }
 
 impl Runner {
@@ -48,8 +53,27 @@ impl Runner {
             )
         })?;
 
+        let mut first_batch = None;
         let database = match parameters.database.prefilter {
-            false => parameters.database.clone().build(fasta),
+            false => {
+                // Building the index and reading the first batch of spectra are
+                // independent and each leaves cores idle (serial steps, IO), so
+                // overlap them.
+                let reader = Self {
+                    database: IndexedDatabase::default(),
+                    parameters: parameters.clone(),
+                    start,
+                    first_batch: None,
+                };
+                let paths = &parameters.mzml_paths;
+                let batch = &paths[..parallel.min(paths.len())];
+                let (database, spectra) = rayon::join(
+                    || parameters.database.clone().build(fasta),
+                    || reader.read_processed_spectra(batch, 0, parallel),
+                );
+                first_batch = Some(spectra);
+                database
+            }
             true => {
                 parameters
                     .database
@@ -67,6 +91,7 @@ impl Runner {
                         database: IndexedDatabase::default(),
                         parameters: parameters.clone(),
                         start,
+                        first_batch: None,
                     };
                     let peptides = mini_runner.prefilter_peptides(parallel, fasta);
                     parameters.database.clone().build_from_peptides(peptides)
@@ -84,6 +109,7 @@ impl Runner {
             database,
             parameters,
             start,
+            first_batch,
         })
     }
 
@@ -309,14 +335,7 @@ impl Runner {
         self.parameters.quant.lfq
     }
 
-    fn process_chunk(
-        &self,
-        scorer: &Scorer,
-        chunk: &[Url],
-        chunk_idx: usize,
-        batch_size: usize,
-    ) -> SageResults {
-        let spectra = self.read_processed_spectra(chunk, chunk_idx, batch_size);
+    fn process_chunk(&self, scorer: &Scorer, spectra: Spectra) -> SageResults {
         let features = self.search_processed_spectra(scorer, &spectra.1);
         self.complete_features(spectra.1, spectra.0, features)
     }
@@ -326,7 +345,7 @@ impl Runner {
         chunk: &[Url],
         chunk_idx: usize,
         batch_size: usize,
-    ) -> (Vec<ProcessedSpectrum>, Vec<ProcessedSpectrum>) {
+    ) -> Spectra {
         // Read all of the spectra at once - this can help prevent memory over-consumption issues
         info!(
             "processing files {} .. {} ",
@@ -415,12 +434,23 @@ impl Runner {
         (ms1_spectra, msn_spectra)
     }
 
-    pub fn batch_files(&self, scorer: &Scorer, batch_size: usize) -> SageResults {
+    fn batch_files(
+        &self,
+        scorer: &Scorer,
+        batch_size: usize,
+        mut first_batch: Option<Spectra>,
+    ) -> SageResults {
         self.parameters
             .mzml_paths
             .chunks(batch_size)
             .enumerate()
-            .map(|(chunk_idx, chunk)| self.process_chunk(scorer, chunk, chunk_idx, batch_size))
+            .map(|(chunk_idx, chunk)| {
+                let spectra = match first_batch.take() {
+                    Some(spectra) if chunk_idx == 0 => spectra,
+                    _ => self.read_processed_spectra(chunk, chunk_idx, batch_size),
+                };
+                self.process_chunk(scorer, spectra)
+            })
             .collect::<SageResults>()
     }
 
@@ -444,7 +474,8 @@ impl Runner {
         };
 
         //Collect all results into a single container
-        let mut outputs = self.batch_files(&scorer, parallel);
+        let first_batch = self.first_batch.take();
+        let mut outputs = self.batch_files(&scorer, parallel, first_batch);
 
         let alignments = if self.parameters.predict_rt {
             // Poisson probability is usually the best single feature for refining FDR.
