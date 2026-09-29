@@ -90,7 +90,11 @@ async fn read_url(url: &Url) -> Result<Box<dyn AsyncBufRead + Unpin + Send>, Err
         BufReader::new(Box::new(tokio_util::io::StreamReader::new(stream)));
 
     if gzip_heuristic(url) {
-        Ok(Box::new(BufReader::new(GzipDecoder::new(reader))))
+        // a gzip file may consist of several members (e.g. concatenated or
+        // block-compressed output); decode all of them, not only the first
+        let mut decoder = GzipDecoder::new(reader);
+        decoder.multiple_members(true);
+        Ok(Box::new(BufReader::new(decoder)))
     } else {
         Ok(Box::new(reader))
     }

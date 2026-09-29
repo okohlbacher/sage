@@ -2659,6 +2659,7 @@ dependencies = [
  "async-compression",
  "base64 0.13.1",
  "bytes",
+ "flate2",
  "futures",
  "log",
  "object_store",

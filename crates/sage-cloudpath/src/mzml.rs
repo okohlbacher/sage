@@ -292,8 +292,22 @@ impl MzMLReader {
                         b"referenceableParamGroup" => {
                             current_group = Some(extract!(ev, b"id").to_vec())
                         }
-                        // `<cvParam ...></cvParam>` is legal too
-                        b"cvParam" if current_group.is_none() => handle_cv!(ev),
+                        // `<cvParam ...></cvParam>` and `<referenceableParamGroupRef ...>
+                        // </referenceableParamGroupRef>` are legal too
+                        b"cvParam" => match &current_group {
+                            Some(id) => param_groups
+                                .entry(id.clone())
+                                .or_default()
+                                .push(ev.clone().into_owned()),
+                            None => handle_cv!(ev),
+                        },
+                        b"referenceableParamGroupRef" => {
+                            let id = extract!(ev, b"ref").to_vec();
+                            let params = param_groups.get(&id).cloned().unwrap_or_default();
+                            for param in &params {
+                                handle_cv!(param);
+                            }
+                        }
                         _ => {}
                     }
                     // State transition into child tag
@@ -371,6 +385,14 @@ impl MzMLReader {
                             }
                         };
 
+                        let width = match binary_dtype {
+                            Dtype::F32 => 4,
+                            Dtype::F64 => 8,
+                        };
+                        if bytes.len() % width != 0 {
+                            // a truncated/corrupt array would otherwise be silently shortened
+                            return Err(MzMLError::CorruptArray(spectrum.id.clone()));
+                        }
                         let array = match binary_dtype {
                             Dtype::F32 => {
                                 let mut buf: [u8; 4] = [0; 4];
@@ -482,6 +504,10 @@ pub enum MzMLError {
     Malformed,
     #[error("truncated MzML: file ends before </mzML> (after {0} spectra)")]
     Truncated(usize),
+    #[error(
+        "corrupt binary array in spectrum {0}: byte count is not a multiple of the value width"
+    )]
+    CorruptArray(String),
     #[error("unsupported cvParam {0}")]
     UnsupportedCV(String),
     #[error("XML parsing error: {0}")]
@@ -591,6 +617,71 @@ mod test {
         assert_eq!(parsed.len(), 2);
         assert!(parsed[0].precursors[0].isolation_window.is_some());
         assert!(parsed[1].precursors[0].isolation_window.is_none());
+    }
+
+    #[tokio::test]
+    async fn param_groups_in_all_element_forms() {
+        let ms_level = r#"<cvParam cvRef="MS" accession="MS:1000511" name="ms level" value="2"/>"#;
+        let centroid =
+            r#"<cvParam cvRef="MS" accession="MS:1000127" name="centroid spectrum" value=""/>"#;
+        let expand = |s: &str| s.replacen("/>", "></cvParam>", 1);
+        for (group_form, ref_form) in [(false, false), (true, false), (false, true), (true, true)] {
+            let (ms, ce) = match group_form {
+                true => (expand(ms_level), expand(centroid)),
+                false => (ms_level.to_string(), centroid.to_string()),
+            };
+            let reference = match ref_form {
+                true => r#"<referenceableParamGroupRef ref="ms2"></referenceableParamGroupRef>"#,
+                false => r#"<referenceableParamGroupRef ref="ms2"/>"#,
+            };
+            let grouped = FIXTURE
+                .replacen(ms_level, reference, 1)
+                .replacen(centroid, "", 1)
+                .replacen(
+                    r#"<referenceableParamGroupList count="1">"#,
+                    &format!(
+                        r#"<referenceableParamGroupList count="2">
+                        <referenceableParamGroup id="ms2">{ms}{ce}</referenceableParamGroup>"#
+                    ),
+                    1,
+                );
+            let parsed = MzMLReader::with_file_id(0)
+                .parse(grouped.as_bytes())
+                .await
+                .unwrap();
+            assert_eq!(parsed[0].ms_level, 2, "group {group_form} ref {ref_form}");
+            assert_eq!(parsed[0].representation, Representation::Centroid);
+        }
+    }
+
+    #[tokio::test]
+    async fn truncated_binary_array_is_an_error() {
+        // drop the last base64 quantum of the first array: 3 bytes -> not a multiple of 4/8
+        let start = FIXTURE.find("<binary>").unwrap() + "<binary>".len();
+        let end = FIXTURE[start..].find("</binary>").unwrap() + start;
+        let b64 = &FIXTURE[start..end];
+        let mut bytes = base64::decode(b64).unwrap();
+        // the fixture's arrays are zlib-compressed: decompress, truncate, recompress
+        use std::io::Read;
+        let mut raw = Vec::new();
+        flate2::read::ZlibDecoder::new(bytes.as_slice())
+            .read_to_end(&mut raw)
+            .unwrap();
+        raw.truncate(raw.len() - 3);
+        let mut enc = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        std::io::Write::write_all(&mut enc, &raw).unwrap();
+        bytes = enc.finish().unwrap();
+        let corrupt = format!(
+            "{}{}{}",
+            &FIXTURE[..start],
+            base64::encode(bytes),
+            &FIXTURE[end..]
+        );
+        let result = MzMLReader::with_file_id(0).parse(corrupt.as_bytes()).await;
+        assert!(
+            matches!(result, Err(MzMLError::CorruptArray(_))),
+            "{result:?}"
+        );
     }
 
     #[tokio::test]

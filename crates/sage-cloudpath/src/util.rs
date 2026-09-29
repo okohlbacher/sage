@@ -175,6 +175,26 @@ mod test {
     use super::*;
 
     #[test]
+    fn multi_member_gzip_is_read_completely() {
+        use std::io::Write;
+        let fixture = include_str!("../../../tests/LQSRPAAPPAPGPGQLTLR.mzML");
+        let (head, tail) = fixture.split_at(fixture.len() / 2);
+        let mut file = Vec::new();
+        for part in [head, tail] {
+            let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            enc.write_all(part.as_bytes()).unwrap();
+            file.extend(enc.finish().unwrap());
+        }
+        let path =
+            std::env::temp_dir().join(format!("sage-multimember-{}.mzML.gz", std::process::id()));
+        std::fs::write(&path, file).unwrap();
+        let url = crate::to_url(path.to_str().unwrap()).unwrap();
+        let spectra = read_mzml(&url, 0, None);
+        std::fs::remove_file(&path).ok();
+        assert_eq!(spectra.unwrap().len(), 1);
+    }
+
+    #[test]
     fn test_identify_format() {
         assert_eq!(FileFormat::from("foo.mzml"), FileFormat::MzML);
         assert_eq!(FileFormat::from("foo.mzML"), FileFormat::MzML);
