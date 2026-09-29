@@ -72,6 +72,8 @@ const INVERSE_ION_MOBILITY: &[u8] = b"MS:1002815";
 
 pub struct MzMLReader {
     ms_level: Option<u8>,
+    // Don't decode or keep MS1 spectra (only LFQ needs them)
+    skip_ms1: bool,
     // If set to Some(level) and noise intensities are present in the MzML file,
     // divide intensities at this MS-level by noise to calculate S/N
     signal_to_noise: Option<u8>,
@@ -88,6 +90,7 @@ impl MzMLReader {
     pub fn with_file_id_and_level_filter(file_id: usize, ms_level: u8) -> Self {
         Self {
             ms_level: Some(ms_level),
+            skip_ms1: false,
             file_id,
             signal_to_noise: None,
         }
@@ -96,9 +99,20 @@ impl MzMLReader {
     pub fn with_file_id(file_id: usize) -> Self {
         Self {
             ms_level: None,
+            skip_ms1: false,
             signal_to_noise: None,
             file_id,
         }
+    }
+
+    pub fn set_skip_ms1(&mut self, skip: bool) -> &mut Self {
+        self.skip_ms1 = skip;
+        self
+    }
+
+    /// Should spectra of this MS level be decoded and returned?
+    fn keep(&self, level: u8) -> bool {
+        self.ms_level.map_or(true, |filter| filter == level) && !(self.skip_ms1 && level == 1)
     }
 
     pub fn set_file_id(&mut self, file_id: usize) -> &mut Self {
@@ -192,13 +206,12 @@ impl MzMLReader {
                         match accession.as_ref() {
                             MS_LEVEL => {
                                 let level = extract_value!(ev);
-                                if let Some(filter) = self.ms_level {
-                                    if level != filter {
-                                        spectrum = RawSpectrum::default_with_file_id(self.file_id);
-                                        state = None;
-                                    }
+                                if !self.keep(level) {
+                                    spectrum = RawSpectrum::default_with_file_id(self.file_id);
+                                    state = None;
+                                } else {
+                                    spectrum.ms_level = level;
                                 }
-                                spectrum.ms_level = level;
                             }
                             PROFILE => spectrum.representation = Representation::Profile,
                             CENTROID => spectrum.representation = Representation::Centroid,
@@ -365,10 +378,8 @@ impl MzMLReader {
                 },
                 Ok(Event::Text(text)) => {
                     if let Some(State::Binary) = state {
-                        if let Some(filter) = self.ms_level {
-                            if spectrum.ms_level != filter {
-                                continue;
-                            }
+                        if !self.keep(spectrum.ms_level) {
+                            continue;
                         }
                         let raw = text.unescape()?;
                         // There are occasionally empty binary data arrays, or unknown CVs
@@ -463,11 +474,9 @@ impl MzMLReader {
                         }
                         (Some(State::Scan), b"scan") => Some(State::Spectrum),
                         (_, b"spectrum") => {
-                            let allow = self
-                                .ms_level
-                                .as_ref()
-                                .map(|&level| level == spectrum.ms_level)
-                                .unwrap_or(true);
+                            // a skipped or reset spectrum (filtered level, TIC 0) has lost its
+                            // id; it used to be pushed as an empty "level 0" spectrum
+                            let allow = self.keep(spectrum.ms_level) && !spectrum.id.is_empty();
 
                             match (allow, self.signal_to_noise) {
                                 (true, Some(level))
@@ -689,6 +698,56 @@ mod test {
             matches!(result, Err(MzMLError::CorruptArray(_))),
             "{result:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn ms1_can_be_skipped_and_reset_spectra_are_not_pushed() {
+        let start = FIXTURE.find("<spectrum ").unwrap();
+        let end = FIXTURE.find("</spectrum>").unwrap() + "</spectrum>".len();
+        let ms1 = FIXTURE[start..end]
+            .replace(
+                r#"name="ms level" value="2""#,
+                r#"name="ms level" value="1""#,
+            )
+            .replace("scan=30069", "scan=30068");
+        let two = format!("{}{}{}", &FIXTURE[..start], ms1, &FIXTURE[start..]);
+        let all = MzMLReader::with_file_id(0)
+            .parse(two.as_bytes())
+            .await
+            .unwrap();
+        assert_eq!(
+            all.iter().map(|s| s.ms_level).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        let ms2 = MzMLReader::with_file_id(0)
+            .set_skip_ms1(true)
+            .parse(two.as_bytes())
+            .await
+            .unwrap();
+        assert_eq!(ms2.len(), 1);
+        assert_eq!(ms2[0].ms_level, 2);
+
+        // a spectrum with TIC 0 is dropped, not pushed as an empty "level 0" spectrum
+        let tic0 = regex_replace_tic(FIXTURE);
+        let parsed = MzMLReader::with_file_id(0)
+            .parse(tic0.as_bytes())
+            .await
+            .unwrap();
+        assert!(
+            parsed.is_empty(),
+            "{:?}",
+            parsed
+                .iter()
+                .map(|s| (&s.id, s.ms_level))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    fn regex_replace_tic(s: &str) -> String {
+        let i = s.find(r#"accession="MS:1000285""#).unwrap();
+        let v = s[i..].find("value=\"").unwrap() + i + "value=\"".len();
+        let e = s[v..].find('"').unwrap() + v;
+        format!("{}0{}", &s[..v], &s[e..])
     }
 
     #[tokio::test]

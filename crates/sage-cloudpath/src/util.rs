@@ -67,7 +67,7 @@ pub fn read_spectra(
     requires_ms1: bool,
 ) -> Result<Vec<RawSpectrum>, Error> {
     match FileFormat::from(url.as_ref()) {
-        FileFormat::MzML => read_mzml(url, file_id, sn),
+        FileFormat::MzML => read_mzml_levels(url, file_id, sn, !requires_ms1),
         FileFormat::MGF => read_mgf(url, file_id),
         FileFormat::TDF => read_tdf(url, file_id, bruker_processor, requires_ms1),
         FileFormat::Unidentified => Err(Error::UnsupportedFormat(url.to_string())),
@@ -79,9 +79,21 @@ pub fn read_mzml(
     file_id: usize,
     signal_to_noise: Option<u8>,
 ) -> Result<Vec<RawSpectrum>, Error> {
+    read_mzml_levels(url, file_id, signal_to_noise, false)
+}
+
+/// Like [`read_mzml`], optionally without decoding/keeping MS1 spectra (which only LFQ
+/// uses; they are ~90% of the peaks of typical DDA files)
+pub fn read_mzml_levels(
+    url: &Url,
+    file_id: usize,
+    signal_to_noise: Option<u8>,
+    skip_ms1: bool,
+) -> Result<Vec<RawSpectrum>, Error> {
     read_and_execute(url, |bf| async move {
         Ok(crate::mzml::MzMLReader::with_file_id(file_id)
             .set_signal_to_noise(signal_to_noise)
+            .set_skip_ms1(skip_ms1)
             .parse(bf)
             .await?)
     })
