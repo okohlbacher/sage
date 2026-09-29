@@ -35,6 +35,13 @@ const ZLIB_COMPRESSION: &[u8] = b"MS:1000574";
 const NO_COMPRESSION: &[u8] = b"MS:1000576";
 
 // MUST supply only one of the following
+const NUMPRESS_LINEAR: &[u8] = b"MS:1002312";
+const NUMPRESS_PIC: &[u8] = b"MS:1002313";
+const NUMPRESS_SLOF: &[u8] = b"MS:1002314";
+const NUMPRESS_LINEAR_ZLIB: &[u8] = b"MS:1002746";
+const NUMPRESS_PIC_ZLIB: &[u8] = b"MS:1002747";
+const NUMPRESS_SLOF_ZLIB: &[u8] = b"MS:1002748";
+
 const INTENSITY_ARRAY: &[u8] = b"MS:1000515";
 const MZ_ARRAY: &[u8] = b"MS:1000514";
 const NOISE_ARRAY: &[u8] = b"MS:1002744";
@@ -166,10 +173,18 @@ impl MzMLReader {
                             INTENSITY_ARRAY => binary_array = Some(BinaryKind::Intensity),
                             MZ_ARRAY => binary_array = Some(BinaryKind::Mz),
                             NOISE_ARRAY => binary_array = Some(BinaryKind::Noise),
-                            _ => {
-                                // Unknown CV - perhaps noise
-                                binary_array = None;
+                            NUMPRESS_LINEAR | NUMPRESS_PIC | NUMPRESS_SLOF
+                            | NUMPRESS_LINEAR_ZLIB | NUMPRESS_PIC_ZLIB | NUMPRESS_SLOF_ZLIB => {
+                                // Decoding these bytes as floats would give garbage
+                                return Err(MzMLError::UnsupportedCV(format!(
+                                    "{} (MS-Numpress compression); convert without numpress",
+                                    String::from_utf8_lossy(&accession)
+                                )));
                             }
+                            // Other cvParams (units, array names...) don't change the array
+                            // type; an array whose type is never recognised stays `None` and
+                            // is skipped
+                            _ => {}
                         }
                     }
                     Some(State::Spectrum) => {
@@ -296,6 +311,16 @@ impl MzMLReader {
                             let id = extract!(ev, b"id");
                             let id = std::str::from_utf8(&id)?;
                             spectrum.id = id.to_string();
+                            // nothing may leak from the previous spectrum
+                            precursor = Precursor::default();
+                            iso_window_lo = None;
+                            iso_window_hi = None;
+                            noise_array.clear();
+                        }
+                        b"binaryDataArray" => {
+                            compression = false;
+                            binary_dtype = Dtype::F64;
+                            binary_array = None;
                         }
                         b"precursor" => {
                             // Not all precursor fields have a spectrumRef
@@ -350,8 +375,7 @@ impl MzMLReader {
                             Dtype::F32 => {
                                 let mut buf: [u8; 4] = [0; 4];
                                 bytes
-                                    .chunks(4)
-                                    .filter(|chunk| chunk.len() == 4)
+                                    .chunks_exact(4)
                                     .map(|chunk| {
                                         buf.copy_from_slice(chunk);
                                         f32::from_le_bytes(buf)
@@ -360,8 +384,9 @@ impl MzMLReader {
                             }
                             Dtype::F64 => {
                                 let mut buf: [u8; 8] = [0; 8];
+                                // `chunks(8)` panicked on a truncated/corrupt array
                                 bytes
-                                    .chunks(8)
+                                    .chunks_exact(8)
                                     .map(|chunk| {
                                         buf.copy_from_slice(chunk);
                                         f64::from_le_bytes(buf) as f32
@@ -511,6 +536,61 @@ mod test {
         assert_eq!(parsed[0].representation, Representation::Centroid);
         assert_eq!(parsed[0].mz, expected[0].mz);
         assert_eq!(parsed[0].precursors.len(), expected[0].precursors.len());
+    }
+
+    const FIXTURE: &str = include_str!("../../../tests/LQSRPAAPPAPGPGQLTLR.mzML");
+
+    #[tokio::test]
+    async fn numpress_is_an_error_not_garbage() {
+        let numpress = FIXTURE.replacen("MS:1000574", "MS:1002312", 1);
+        let result = MzMLReader::with_file_id(0).parse(numpress.as_bytes()).await;
+        assert!(
+            matches!(result, Err(MzMLError::UnsupportedCV(_))),
+            "{result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_cv_params_do_not_drop_arrays() {
+        let expected = MzMLReader::with_file_id(0)
+            .parse(FIXTURE.as_bytes())
+            .await
+            .unwrap();
+        // an unrelated cvParam after the array-type cvParam used to reset the array type,
+        // silently dropping the m/z array
+        let extra = r#"<cvParam cvRef="MS" accession="MS:1000786" name="non-standard data array" value=""/>"#;
+        let with_extra = FIXTURE.replace(
+            r#"unitName="m/z"/>"#,
+            &format!(r#"unitName="m/z"/>{extra}"#),
+        );
+        assert_ne!(with_extra, FIXTURE);
+        let parsed = MzMLReader::with_file_id(0)
+            .parse(with_extra.as_bytes())
+            .await
+            .unwrap();
+        assert!(!parsed[0].mz.is_empty());
+        assert_eq!(parsed[0].mz, expected[0].mz);
+        assert_eq!(parsed[0].intensity, expected[0].intensity);
+    }
+
+    #[tokio::test]
+    async fn isolation_window_does_not_leak_into_next_spectrum() {
+        let start = FIXTURE.find("<spectrum ").unwrap();
+        let end = FIXTURE.find("</spectrum>").unwrap() + "</spectrum>".len();
+        let without_window = FIXTURE[start..end]
+            .lines()
+            .filter(|l| !l.contains("MS:1000828") && !l.contains("MS:1000829"))
+            .collect::<Vec<_>>()
+            .join("\n")
+            .replace("scan=30069", "scan=30070");
+        let two = format!("{}{}{}", &FIXTURE[..end], without_window, &FIXTURE[end..]);
+        let parsed = MzMLReader::with_file_id(0)
+            .parse(two.as_bytes())
+            .await
+            .unwrap();
+        assert_eq!(parsed.len(), 2);
+        assert!(parsed[0].precursors[0].isolation_window.is_some());
+        assert!(parsed[1].precursors[0].isolation_window.is_none());
     }
 
     #[tokio::test]
