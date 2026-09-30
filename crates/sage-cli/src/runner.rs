@@ -822,10 +822,6 @@ impl Runner {
     ) -> anyhow::Result<Url> {
         let path = self.make_path("results.sage.tsv");
 
-        let mut wtr = csv::WriterBuilder::new()
-            .delimiter(b'\t')
-            .from_writer(vec![]);
-
         let csv_headers = vec![
             "psm_id",
             "peptide",
@@ -873,18 +869,9 @@ impl Runner {
         ];
 
         let headers = csv::ByteRecord::from(csv_headers);
-
-        wtr.write_byte_record(&headers)?;
-        for record in features
-            .into_par_iter()
-            .map(|feat| self.serialize_feature(feat, filenames))
-            .collect::<Vec<_>>()
-        {
-            wtr.write_byte_record(&record)?;
-        }
-
-        wtr.flush()?;
-        let bytes = wtr.into_inner()?;
+        let bytes = tsv_bytes(&headers, features, |feat| {
+            self.serialize_feature(feat, filenames)
+        })?;
         sage_cloudpath::write_bytes_sync(&path, bytes)?;
         Ok(path)
     }
@@ -1061,10 +1048,6 @@ impl Runner {
     pub fn write_pin(&self, features: &[Feature], filenames: &[String]) -> anyhow::Result<Url> {
         let path = self.make_path("results.sage.pin");
 
-        let mut wtr = csv::WriterBuilder::new()
-            .delimiter(b'\t')
-            .from_writer(vec![]);
-
         let headers = csv::ByteRecord::from(vec![
             "SpecId",
             "Label",
@@ -1108,17 +1091,9 @@ impl Runner {
 
         let re = regex::Regex::new(r"scan=(\d+)").expect("This is valid regex");
 
-        wtr.write_byte_record(&headers)?;
-        for record in features
-            .into_par_iter()
-            .map(|feat| self.serialize_pin(&re, feat, filenames))
-            .collect::<Vec<_>>()
-        {
-            wtr.write_byte_record(&record)?;
-        }
-
-        wtr.flush()?;
-        let bytes = wtr.into_inner()?;
+        let bytes = tsv_bytes(&headers, features, |feat| {
+            self.serialize_pin(&re, feat, filenames)
+        })?;
         sage_cloudpath::write_bytes_sync(&path, bytes)?;
         Ok(path)
     }
@@ -1789,4 +1764,38 @@ impl Runner {
 
         Ok(path)
     }
+}
+
+/// `header` and one record per item as tab-separated bytes. Chunks of records are
+/// serialized in parallel, each by its own writer (quoting is per record, so the bytes
+/// are those of one writer); the serial per-record writing used to be most of the
+/// output time.
+fn tsv_bytes<T: Sync>(
+    header: &csv::ByteRecord,
+    items: &[T],
+    record: impl Fn(&T) -> csv::ByteRecord + Sync,
+) -> anyhow::Result<Vec<u8>> {
+    let writer = || {
+        csv::WriterBuilder::new()
+            .delimiter(b'\t')
+            .from_writer(Vec::new())
+    };
+    let chunks = items
+        .par_chunks(4096)
+        .map(|chunk| {
+            let mut wtr = writer();
+            for item in chunk {
+                wtr.write_byte_record(&record(item))?;
+            }
+            Ok(wtr.into_inner()?)
+        })
+        .collect::<anyhow::Result<Vec<Vec<u8>>>>()?;
+    let mut wtr = writer();
+    wtr.write_byte_record(header)?;
+    let mut bytes = wtr.into_inner()?;
+    bytes.reserve_exact(chunks.iter().map(Vec::len).sum());
+    for chunk in chunks {
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
 }
