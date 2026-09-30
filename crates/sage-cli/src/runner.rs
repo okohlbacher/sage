@@ -573,6 +573,11 @@ impl Runner {
             q_protein_group
         );
         log::trace!("writing outputs");
+        // PSM ids come from a counter shared by the parallel search, so they differed
+        // between runs; number the (deterministically ordered) output rows instead
+        for (ix, feature) in outputs.features.iter_mut().enumerate() {
+            feature.psm_id = ix + 1;
+        }
         let output_start = Instant::now();
 
         // Write either a single parquet file, or multiple tsv files
