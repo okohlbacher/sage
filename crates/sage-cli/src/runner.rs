@@ -413,19 +413,23 @@ impl Runner {
             log::trace!("- {}: read {} spectra", path, s.len());
             Ok(s.into_par_iter().partition(|s| s.level == 1))
         };
-        let per_file = if file_serial_read {
-            chunk
-                .iter()
-                .enumerate()
-                .map(read_and_process)
-                .collect::<anyhow::Result<Vec<_>>>()?
+        // Formats read in parallel within a file (.d) go a few files at a time: one file's
+        // serial setup (SQL tables, frame index; ~0.2 s) overlaps another's parallel work
+        let items = chunk.iter().enumerate().collect::<Vec<_>>();
+        let group = if file_serial_read {
+            4
         } else {
-            chunk
-                .par_iter()
-                .enumerate()
-                .map(read_and_process)
-                .collect::<anyhow::Result<Vec<_>>>()?
+            items.len().max(1)
         };
+        let mut per_file = Vec::with_capacity(items.len());
+        for files in items.chunks(group) {
+            per_file.extend(
+                files
+                    .par_iter()
+                    .map(|&item| read_and_process(item))
+                    .collect::<anyhow::Result<Vec<_>>>()?,
+            );
+        }
         let (mut ms1_spectra, mut msn_spectra) = (Vec::new(), Vec::new());
         for (ms1, msn) in per_file {
             ms1_spectra.extend(ms1);
