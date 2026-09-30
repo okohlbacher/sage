@@ -1593,12 +1593,14 @@ impl Runner {
                 });
                 scoring_section.add_plot(pp_plot);
 
+                // q-values of all features (the scores above skip non-finite ones)
+                let all_labels = features.iter().map(|f| f.label).collect::<Vec<_>>();
                 let spectrum_q_histogram = plot_score_histogram(
                     &features
                         .iter()
                         .map(|f| f.spectrum_q as f64)
                         .collect::<Vec<f64>>(),
-                    &labels,
+                    &all_labels,
                     "Spectrum Q-value",
                     "Q-value",
                 )
@@ -1610,7 +1612,7 @@ impl Runner {
                         .iter()
                         .map(|f| f.peptide_q as f64)
                         .collect::<Vec<f64>>(),
-                    &labels,
+                    &all_labels,
                     "Peptide Q-value",
                     "Q-value",
                 )
@@ -1622,7 +1624,7 @@ impl Runner {
                         .iter()
                         .map(|f| f.protein_q as f64)
                         .collect::<Vec<f64>>(),
-                    &labels,
+                    &all_labels,
                     "Protein Q-value",
                     "Q-value",
                 )

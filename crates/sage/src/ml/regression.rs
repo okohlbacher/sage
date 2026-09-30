@@ -77,18 +77,22 @@ impl LinearRegression {
     ) -> Option<Self> {
         // fixed chunks merged in order: the floating-point sums (and so the model) do
         // not depend on how rayon happens to split the work between threads
-        let acc = items
-            .par_chunks(4096)
-            .map(|chunk| {
-                let mut acc = Acc::zero(D);
-                for x in chunk.iter().filter(|x| filter(x)) {
-                    acc.add_row(&embed(x), target(x));
-                }
-                acc
-            })
-            .collect::<Vec<_>>()
-            .into_iter()
-            .fold(Acc::zero(D), Acc::merge);
+        // (in waves of chunks, so the per-chunk accumulators alive are bounded)
+        const CHUNK: usize = 4096;
+        let mut acc = Acc::zero(D);
+        for wave in items.chunks(CHUNK * 256) {
+            let partial = wave
+                .par_chunks(CHUNK)
+                .map(|chunk| {
+                    let mut acc = Acc::zero(D);
+                    for x in chunk.iter().filter(|x| filter(x)) {
+                        acc.add_row(&embed(x), target(x));
+                    }
+                    acc
+                })
+                .collect::<Vec<_>>();
+            acc = partial.into_iter().fold(acc, Acc::merge);
+        }
 
         if acc.n == 0 {
             return None;

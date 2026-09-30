@@ -89,7 +89,7 @@ impl Fasta {
             let explicit = targets
                 .iter()
                 .enumerate()
-                .filter(|(ix, _)| !placeholders.contains(ix))
+                .filter(|(ix, _)| placeholders.binary_search(ix).is_err())
                 .map(|(_, (acc, _))| acc.clone())
                 .collect::<std::collections::HashSet<_>>();
             for &ix in &placeholders {

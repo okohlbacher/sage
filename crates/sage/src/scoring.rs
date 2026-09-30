@@ -384,8 +384,8 @@ impl<'db> Scorer<'db> {
             }
         }
         if hits.matched_peaks == 0 {
-            // no candidate matched: don't hand the dense (all-empty) array to the caller
-            hits.preliminary = Vec::new();
+            // the dense all-empty array is kept: dropping it would change which of two
+            // equally scoring candidates (e.g. I/L isomers) the later selection ranks first
             return hits;
         }
 
@@ -470,37 +470,52 @@ impl<'db> Scorer<'db> {
         // (skip table, then fragments). Run the lookups as a pipeline, `AHEAD` apart:
         // prefetch a page's skip entries, then narrow by them and prefetch the fragment
         // blocks, then search and scan -- so the misses of several lookups overlap.
+        // The lookups are generated lazily and pass through a fixed ring, so scratch
+        // memory does not grow with their number (wide fragment tolerances).
         const AHEAD: usize = 8;
+        const RING: usize = 2 * AHEAD + 1;
         let max_fragment_charge = max_fragment_charge(self.max_fragment_charge, precursor_charge);
-        let mut lookups: Vec<(usize, f32, f32)> = Vec::new();
-        for peak_mass in query.masses.iter() {
-            for charge in 1..max_fragment_charge {
-                let (fragment_lo, fragment_hi) =
-                    self.fragment_tol.bounds(peak_mass * charge as f32);
+        let fragment_tol = self.fragment_tol;
+        let mut lookups = query.masses.iter().flat_map(|peak_mass| {
+            (1..max_fragment_charge).flat_map(move |charge| {
+                let (fragment_lo, fragment_hi) = fragment_tol.bounds(peak_mass * charge as f32);
                 let (page_lo, page_hi) = binary_search_slice(
                     &db.min_value,
                     |min, bounds| min.total_cmp(bounds),
                     fragment_lo,
                     fragment_hi,
                 );
-                lookups.extend((page_lo..page_hi).map(|page| (page, fragment_lo, fragment_hi)));
+                (page_lo..page_hi).map(move |page| (page, fragment_lo, fragment_hi))
+            })
+        });
+        // (page, fragment_lo, fragment_hi, block start, block end)
+        let mut ring = [(0usize, 0f32, 0f32, 0usize, 0usize); RING];
+        let mut pulled = 0;
+        let mut exhausted = false;
+        for i in 0.. {
+            if !exhausted {
+                match lookups.next() {
+                    Some((page, lo, hi)) => {
+                        prefetch(db.page_skip(page));
+                        ring[i % RING] = (page, lo, hi, 0, 0);
+                        pulled += 1;
+                    }
+                    None => exhausted = true,
+                }
             }
-        }
-        let mut blocks = vec![(0usize, 0usize); lookups.len()];
-        for i in 0..lookups.len() + 2 * AHEAD {
-            if let Some(&(page, _, _)) = lookups.get(i) {
-                prefetch(db.page_skip(page));
+            if exhausted && i >= pulled + 2 * AHEAD {
+                break;
             }
-            if let Some(j) = i.checked_sub(AHEAD).filter(|&j| j < lookups.len()) {
-                let (s, e) = db.page_blocks(lookups[j].0, union_lo, union_hi);
+            if let Some(j) = i.checked_sub(AHEAD).filter(|&j| j < pulled) {
+                let slot = &mut ring[j % RING];
+                let (s, e) = db.page_blocks(slot.0, union_lo, union_hi);
                 prefetch(&db.fragments[s..e]);
-                blocks[j] = (s, e);
+                (slot.3, slot.4) = (s, e);
             }
-            let Some(k) = i.checked_sub(2 * AHEAD).filter(|&k| k < lookups.len()) else {
+            let Some(k) = i.checked_sub(2 * AHEAD).filter(|&k| k < pulled) else {
                 continue;
             };
-            let (_, fragment_lo, fragment_hi) = lookups[k];
-            let (s, e) = blocks[k];
+            let (_, fragment_lo, fragment_hi, s, e) = ring[k % RING];
             let (l, r) = binary_search_slice(
                 &db.fragments[s..e],
                 |frag, bound| (frag.peptide_index.0 as usize).cmp(bound),
@@ -539,10 +554,9 @@ impl<'db> Scorer<'db> {
         windows
             .into_iter()
             .fold(InitialHits::default(), |mut acc, mut w| {
+                // as `matched_peaks_with_isotope`: an unmatched window keeps its dense array
                 if w.hits.matched_peaks > 0 {
                     self.trim_hits(&mut w.hits);
-                } else {
-                    w.hits.preliminary = Vec::new();
                 }
                 acc += w.hits;
                 acc
@@ -1139,12 +1153,16 @@ mod tests {
                     "isotopes {min_iso}..={max_iso}"
                 );
 
-                // no fragment matches: no dense all-empty candidate array is returned
+                // no fragment matches: same (dense, empty) result as the per-window search
                 let mut empty = query.clone();
                 empty.masses.clear();
-                let none = scorer.matched_peaks(&empty, precursor_mass, charge, precursor_tol);
+                // (`initial_hits` trims every result once more)
+                let mut none = scorer.matched_peaks(&empty, precursor_mass, charge, precursor_tol);
+                scorer.trim_hits(&mut none);
+                let reference =
+                    per_window_reference(&scorer, &empty, precursor_mass, charge, precursor_tol);
                 assert_eq!(none.matched_peaks, 0);
-                assert!(none.preliminary.is_empty());
+                assert_eq!(none.preliminary, reference.preliminary);
             }
         }
     }

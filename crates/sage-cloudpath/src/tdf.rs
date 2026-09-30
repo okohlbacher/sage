@@ -56,7 +56,7 @@ impl TdfReader {
         };
         if requires_ms1 {
             let ms1s = self.read_ms1_spectra(&path_name, file_id, config.ms1)?;
-            spectra.extend(ms1s.into_iter().map(&f));
+            spectra.extend(ms1s.into_par_iter().map(&f).collect::<Vec<_>>());
         }
 
         Ok(spectra)
@@ -439,6 +439,14 @@ fn dda_frames_once<T: Send>(
     if config.spectrum_processing_params.calibrate {
         return None;
     }
+    // only TDF: probing a MiniTDF directory's SQL sidecar could abort in timsrust
+    let tims_path = TimsTofPath::new(path).ok()?;
+    if !matches!(
+        tims_path.file_type(),
+        timsrust::readers::TimsTofFileType::TDF
+    ) {
+        return None;
+    }
     let frames = FrameReader::new(path).ok()?;
     if frames.get_acquisition() != timsrust::AcquisitionType::DDAPASEF {
         return None;
@@ -450,11 +458,13 @@ fn dda_frames_once<T: Send>(
         .finalize()
         .ok()?;
 
-    let tdf = TimsTofPath::new(path).ok()?.tdf().ok()?;
+    let tdf = tims_path.tdf().ok()?;
     let db = rusqlite::Connection::open_with_flags(tdf, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
         .ok()?;
+    // timsrust's exact query: SQLite may return rows in a different order for another
+    // projection (a covering index), and the last row of a precursor sets its width
     let mut stmt = db
-        .prepare("SELECT Frame, ScanNumBegin, ScanNumEnd, IsolationWidth, Precursor FROM PasefFrameMsMsInfo")
+        .prepare("SELECT Frame, ScanNumBegin, ScanNumEnd, IsolationMz, IsolationWidth, CollisionEnergy, Precursor FROM PasefFrameMsMsInfo")
         .ok()?;
     // missing values read as 0, as in timsrust
     let mut pasef = stmt
@@ -463,8 +473,8 @@ fn dda_frames_once<T: Send>(
                 frame: row.get(0).unwrap_or_default(),
                 scan_start: row.get(1).unwrap_or_default(),
                 scan_end: row.get(2).unwrap_or_default(),
-                isolation_width: row.get(3).unwrap_or_default(),
-                precursor: row.get(4).unwrap_or_default(),
+                isolation_width: row.get(4).unwrap_or_default(),
+                precursor: row.get(6).unwrap_or_default(),
             })
         })
         .ok()?
@@ -486,10 +496,31 @@ fn dda_frames_once<T: Send>(
 
     let smoothing = config.spectrum_processing_params.smoothing_window;
     let centroiding = config.spectrum_processing_params.centroiding_window;
-    // ponytail: fixed block of spectra; bounds decoded frames to ~1000 at a time
-    const BLOCK: usize = 4096;
+    // Blocks of up to 4096 spectra referencing at most 1024 distinct frames: bounds the
+    // decoded frames alive at a time (~1000 for a typical ddaPASEF block).
+    // ponytail: bounded by frame count, not bytes; frames of a DDA run are small
+    const MAX_SPECTRA: usize = 4096;
+    const MAX_FRAMES: usize = 1024;
+    let mut blocks = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut block_start = 0;
+    for (ix, group) in groups.iter().enumerate() {
+        let new = pasef[group.clone()]
+            .iter()
+            .filter(|p| !seen.contains(&p.frame))
+            .count();
+        if ix > block_start && (ix - block_start == MAX_SPECTRA || seen.len() + new > MAX_FRAMES) {
+            blocks.push(block_start..ix);
+            block_start = ix;
+            seen.clear();
+        }
+        seen.extend(pasef[group.clone()].iter().map(|p| p.frame));
+    }
+    blocks.push(block_start..groups.len());
+
     let mut spectra = Vec::with_capacity(groups.len());
-    for (block_ix, block) in groups.chunks(BLOCK).enumerate() {
+    for block_range in blocks {
+        let block = &groups[block_range.clone()];
         let mut needed = block
             .iter()
             .flat_map(|g| pasef[g.clone()].iter().map(|p| p.frame - 1))
@@ -511,7 +542,7 @@ fn dda_frames_once<T: Send>(
             .par_iter()
             .enumerate()
             .map(|(k, group)| {
-                let index = block_ix * BLOCK + k;
+                let index = block_range.start + k;
                 let mut isolation_width = 0.0;
                 let mut tof = Vec::new();
                 let mut intensity = Vec::new();

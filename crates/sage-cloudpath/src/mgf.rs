@@ -360,6 +360,12 @@ impl MgfReader {
                 return Ok(Vec::new());
             };
             let line = line.trim();
+            if line.starts_with("END IONS") {
+                // END IONS before any block
+                return Err(MgfError::Malformed {
+                    location: *Location::caller(),
+                });
+            }
             for parser in &default_parsers {
                 match parser(line, &mut default_params) {
                     Ok(true) => break,
@@ -396,6 +402,9 @@ impl MgfReader {
                     return Err(malformed());
                 }
                 in_block = false;
+            } else if !in_block {
+                // between blocks: would be parsed into the next spectrum
+                continue;
             }
             for parser in &query_parsers {
                 match parser(line, &mut query_data) {
@@ -483,6 +492,14 @@ mod test {
         assert!(MgfReader::with_file_id(0)
             .parse(format!("{ok}END IONS\n"))
             .is_err());
+        assert!(MgfReader::with_file_id(0)
+            .parse(format!("END IONS\n{ok}"))
+            .is_err());
+        // peaks between blocks do not end up in the next spectrum
+        let between = format!("{ok}999.9 100\n{ok}");
+        let spectra = MgfReader::with_file_id(0).parse(between).unwrap();
+        assert_eq!(spectra.len(), 2);
+        assert_eq!(spectra[1].mz, spectra[0].mz);
     }
 
     #[test]

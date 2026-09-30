@@ -380,12 +380,12 @@ impl SpectrumProcessor {
         }
 
         // If there is no precursor charge from the mzML file, then deisotope fragments up to z=3
-        // the highest listed precursor charge: independent of the order of several
-        // listed charges (MGF "CHARGE=2+ and 4+")
+        // the highest listed precursor charge, an unknown one counting as 3: independent
+        // of the order of several listed charges (MGF "CHARGE=2+ and 4+")
         let charge = spectrum
             .precursors
             .iter()
-            .filter_map(|p| p.charge)
+            .map(|p| p.charge.unwrap_or(3))
             .max()
             .unwrap_or(3);
 
