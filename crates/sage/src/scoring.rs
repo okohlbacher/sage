@@ -556,25 +556,18 @@ impl<'db> Scorer<'db> {
         precursor_charge: u8,
         precursor_tol: Tolerance,
     ) -> InitialHits {
+        // also for a single isotope window (the default): its lookups are pipelined too
+        let mut hits = self.matched_peaks_isotope_windows(
+            query,
+            precursor_mass,
+            precursor_charge,
+            precursor_tol,
+        );
         if self.min_isotope_err != self.max_isotope_err {
-            let mut hits = self.matched_peaks_isotope_windows(
-                query,
-                precursor_mass,
-                precursor_charge,
-                precursor_tol,
-            );
+            // one window is trimmed already; trimming again could reorder ties
             self.trim_hits(&mut hits);
-            hits
-        } else {
-            // a single isotope window: `isotope_errors: [n, n]` must search window n
-            self.matched_peaks_with_isotope(
-                query,
-                precursor_mass,
-                precursor_charge,
-                precursor_tol,
-                self.min_isotope_err,
-            )
         }
+        hits
     }
 
     /// Charges listed for `precursor` when a spectrum carries several precursors at the
@@ -1134,6 +1127,10 @@ mod tests {
                 // what the scorer actually runs (single window: `isotope_errors [n, n]`)
                 let mut actual =
                     scorer.matched_peaks(&query, precursor_mass, charge, precursor_tol);
+                if min_iso == max_iso {
+                    // same order too: ties are ranked by preliminary order later
+                    assert_eq!(actual.preliminary, expected.preliminary);
+                }
                 let mut expected = expected.preliminary;
                 actual.preliminary.sort();
                 expected.sort();
