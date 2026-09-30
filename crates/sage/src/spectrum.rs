@@ -147,6 +147,43 @@ pub fn select_most_intense_peak(
     best_peak
 }
 
+/// [`select_most_intense_peak`] (without offset) for a sequence of `center`s that is
+/// mostly monotone: `cursor` remembers where the last search ended and is moved from
+/// there, instead of binary-searching all of `masses` again. Same result for any order.
+pub fn most_intense_peak_from(
+    masses: &[f32],
+    intensities: &[f32],
+    center: f32,
+    tolerance: Tolerance,
+    cursor: &mut Option<usize>,
+) -> Option<usize> {
+    let (lo, hi) = tolerance.bounds(center);
+    // first index whose mass is not < lo (the `partition_point` of the binary search)
+    let mut i = match *cursor {
+        None => masses.partition_point(|m| m.total_cmp(&lo) == std::cmp::Ordering::Less),
+        Some(mut i) => {
+            while i > 0 && masses[i - 1].total_cmp(&lo) != std::cmp::Ordering::Less {
+                i -= 1;
+            }
+            while i < masses.len() && masses[i].total_cmp(&lo) == std::cmp::Ordering::Less {
+                i += 1;
+            }
+            i
+        }
+    };
+    *cursor = Some(i);
+    let mut best_peak = None;
+    let mut max_int = 0.0;
+    while i < masses.len() && masses[i].total_cmp(&hi) != std::cmp::Ordering::Greater {
+        if masses[i] >= lo && masses[i] <= hi && intensities[i] >= max_int {
+            max_int = intensities[i];
+            best_peak = Some(i);
+        }
+        i += 1;
+    }
+    best_peak
+}
+
 // pub fn find_spectrum_by_id(
 //     spectra: &[ProcessedSpectrum],
 //     scan_id: usize,
@@ -543,6 +580,37 @@ mod test {
             mz,
             intensity,
             ..Default::default()
+        }
+    }
+
+    #[test]
+    fn cursor_peak_search_matches_binary_search() {
+        // sorted masses with ties in intensity and a NaN at the end (total order)
+        let mut masses = (0..300)
+            .map(|i| 100.0 + (i as f32 * 7.3) % 1900.0)
+            .collect::<Vec<f32>>();
+        masses.push(f32::NAN);
+        masses.sort_by(f32::total_cmp);
+        let intensities = (0..masses.len())
+            .map(|i| (i % 5) as f32)
+            .collect::<Vec<_>>();
+        let tol = Tolerance::Ppm(-2000.0, 1000.0);
+        let up = (0..400)
+            .map(|i| 90.0 + i as f32 * 5.1)
+            .collect::<Vec<f32>>();
+        let down = up.iter().rev().copied().collect::<Vec<_>>();
+        let jumpy = (0..400)
+            .map(|i| 90.0 + ((i * 7919) % 400) as f32 * 5.1)
+            .collect::<Vec<f32>>();
+        for centers in [up, down, jumpy] {
+            let mut cursor = None;
+            for &c in &centers {
+                assert_eq!(
+                    most_intense_peak_from(&masses, &intensities, c, tol, &mut cursor),
+                    select_most_intense_peak(&masses, &intensities, c, tol, None),
+                    "center {c}"
+                );
+            }
         }
     }
 

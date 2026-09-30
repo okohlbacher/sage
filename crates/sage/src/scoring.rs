@@ -925,18 +925,37 @@ impl<'db> Scorer<'db> {
 
         let mut fragments_details = Fragments::default();
 
+        // Ions of one series (and charge) are monotone in m/z: keep a cursor into the
+        // sorted peaks per charge instead of binary-searching each ion
+        let mut cursors = [None::<usize>; 8];
+        let mut series = None;
+
         for (idx, frag) in fragments {
+            if series != Some(frag.kind) {
+                series = Some(frag.kind);
+                cursors = [None; 8];
+            }
             for charge in 1..max_fragment_charge {
                 // Experimental peaks are multipled by charge, therefore theoretical are divided
                 let mz = frag.monoisotopic_mass / charge as f32;
 
-                if let Some(peak_idx) = crate::spectrum::select_most_intense_peak(
-                    &query.masses,
-                    &query.intensities,
-                    mz,
-                    self.fragment_tol,
-                    None,
-                ) {
+                let found = match cursors.get_mut(charge as usize) {
+                    Some(cursor) => crate::spectrum::most_intense_peak_from(
+                        &query.masses,
+                        &query.intensities,
+                        mz,
+                        self.fragment_tol,
+                        cursor,
+                    ),
+                    None => crate::spectrum::select_most_intense_peak(
+                        &query.masses,
+                        &query.intensities,
+                        mz,
+                        self.fragment_tol,
+                        None,
+                    ),
+                };
+                if let Some(peak_idx) = found {
                     let peak_mass = query.masses[peak_idx];
                     let peak_intensity = query.intensities[peak_idx];
                     let fragment_charge = query.charges[peak_idx].max(charge);
