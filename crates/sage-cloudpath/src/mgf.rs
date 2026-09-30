@@ -347,7 +347,8 @@ impl MgfReader {
         let query_parsers = QueryParser.get_parsers();
 
         let mut default_params = DefaultParams::default_with_file_id(self.file_id);
-        let mut lines = contents.as_str().lines();
+        // a leading byte-order mark would hide the first `BEGIN IONS`
+        let mut lines = contents.trim_start_matches('\u{feff}').lines();
 
         // embedded parameters
         while !default_params.is_query_start {
@@ -500,6 +501,15 @@ mod test {
         let spectra = MgfReader::with_file_id(0).parse(between).unwrap();
         assert_eq!(spectra.len(), 2);
         assert_eq!(spectra[1].mz, spectra[0].mz);
+    }
+
+    #[test]
+    fn byte_order_mark_is_ignored() {
+        let block = "BEGIN IONS\nTITLE=a\nPEPMASS=500.25\nCHARGE=2+\n100.1 5\n200.2 7\nEND IONS\n";
+        let spectra = MgfReader::with_file_id(0)
+            .parse(format!("\u{feff}{block}{block}"))
+            .unwrap();
+        assert_eq!(spectra.len(), 2);
     }
 
     #[test]
