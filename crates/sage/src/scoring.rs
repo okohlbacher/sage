@@ -1,4 +1,4 @@
-use crate::database::{binary_search_slice, IndexedDatabase, PeptideIx};
+use crate::database::{binary_search_slice, prefetch, IndexedDatabase, PeptideIx};
 use crate::heap::bounded_min_heapify;
 use crate::ion_series::{IonSeries, Kind};
 use crate::mass::{Tolerance, NEUTRON, PROTON};
@@ -466,7 +466,13 @@ impl<'db> Scorer<'db> {
         let union_lo = windows.iter().map(|w| w.idx_lo).min().unwrap_or_default();
         let union_hi = windows.iter().map(|w| w.idx_hi).max().unwrap_or_default();
 
+        // Each (peak, fragment charge, page) lookup costs a few dependent cache misses
+        // (skip table, then fragments). Run the lookups as a pipeline, `AHEAD` apart:
+        // prefetch a page's skip entries, then narrow by them and prefetch the fragment
+        // blocks, then search and scan -- so the misses of several lookups overlap.
+        const AHEAD: usize = 8;
         let max_fragment_charge = max_fragment_charge(self.max_fragment_charge, precursor_charge);
+        let mut lookups: Vec<(usize, f32, f32)> = Vec::new();
         for peak_mass in query.masses.iter() {
             for charge in 1..max_fragment_charge {
                 let (fragment_lo, fragment_hi) =
@@ -477,36 +483,55 @@ impl<'db> Scorer<'db> {
                     fragment_lo,
                     fragment_hi,
                 );
-                for page in page_lo..page_hi {
-                    let (inner_lo, inner_hi) = db.page_range(page, union_lo, union_hi);
-                    for frag in &db.fragments[inner_lo..inner_hi] {
-                        // same (positive) predicate as `page_search`, so NaN never matches
-                        if !(frag.fragment_mz >= fragment_lo && frag.fragment_mz <= fragment_hi) {
-                            continue;
-                        }
-                        let ix = frag.peptide_index.0 as usize;
-                        // windows may overlap (wide Da tolerances): check each of them
-                        for w in windows.iter_mut() {
-                            // same edge handling as `IndexedQuery::page_search`
-                            let inside = (ix > w.idx_lo
-                                || (ix == w.idx_lo && db.peptides[ix].monoisotopic >= w.mass_lo))
-                                && (ix < w.idx_hi
-                                    || (ix == w.idx_hi
-                                        && db.peptides[ix].monoisotopic <= w.mass_hi));
-                            if !inside {
-                                continue;
-                            }
-                            let sc = &mut w.hits.preliminary[ix - w.idx_lo];
-                            if sc.matched == 0 {
-                                w.hits.scored_candidates += 1;
-                                sc.precursor_charge = precursor_charge;
-                                sc.peptide = frag.peptide_index;
-                                sc.isotope_error = w.isotope;
-                            }
-                            sc.matched += 1;
-                            w.hits.matched_peaks += 1;
-                        }
+                lookups.extend((page_lo..page_hi).map(|page| (page, fragment_lo, fragment_hi)));
+            }
+        }
+        let mut blocks = vec![(0usize, 0usize); lookups.len()];
+        for i in 0..lookups.len() + 2 * AHEAD {
+            if let Some(&(page, _, _)) = lookups.get(i) {
+                prefetch(db.page_skip(page));
+            }
+            if let Some(j) = i.checked_sub(AHEAD).filter(|&j| j < lookups.len()) {
+                let (s, e) = db.page_blocks(lookups[j].0, union_lo, union_hi);
+                prefetch(&db.fragments[s..e]);
+                blocks[j] = (s, e);
+            }
+            let Some(k) = i.checked_sub(2 * AHEAD).filter(|&k| k < lookups.len()) else {
+                continue;
+            };
+            let (_, fragment_lo, fragment_hi) = lookups[k];
+            let (s, e) = blocks[k];
+            let (l, r) = binary_search_slice(
+                &db.fragments[s..e],
+                |frag, bound| (frag.peptide_index.0 as usize).cmp(bound),
+                union_lo,
+                union_hi,
+            );
+            for frag in &db.fragments[s + l..s + r] {
+                // same (positive) predicate as `page_search`, so NaN never matches
+                if !(frag.fragment_mz >= fragment_lo && frag.fragment_mz <= fragment_hi) {
+                    continue;
+                }
+                let ix = frag.peptide_index.0 as usize;
+                // windows may overlap (wide Da tolerances): check each of them
+                for w in windows.iter_mut() {
+                    // same edge handling as `IndexedQuery::page_search`
+                    let inside = (ix > w.idx_lo
+                        || (ix == w.idx_lo && db.peptides[ix].monoisotopic >= w.mass_lo))
+                        && (ix < w.idx_hi
+                            || (ix == w.idx_hi && db.peptides[ix].monoisotopic <= w.mass_hi));
+                    if !inside {
+                        continue;
                     }
+                    let sc = &mut w.hits.preliminary[ix - w.idx_lo];
+                    if sc.matched == 0 {
+                        w.hits.scored_candidates += 1;
+                        sc.precursor_charge = precursor_charge;
+                        sc.peptide = frag.peptide_index;
+                        sc.isotope_error = w.isotope;
+                    }
+                    sc.matched += 1;
+                    w.hits.matched_peaks += 1;
                 }
             }
         }

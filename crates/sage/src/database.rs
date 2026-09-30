@@ -563,6 +563,27 @@ impl IndexedDatabase {
     /// is the dominant cost of the search. The skip table (4 bytes per `SKIP` fragments,
     /// ~18 MB for human tryptic) first narrows the search to a few `SKIP`-sized blocks.
     pub fn page_range(&self, page: usize, lo: usize, hi: usize) -> (usize, usize) {
+        let (s, e) = self.page_blocks(page, lo, hi);
+        let (l, r) = binary_search_slice(
+            &self.fragments[s..e],
+            |frag, bound| (frag.peptide_index.0 as usize).cmp(bound),
+            lo,
+            hi,
+        );
+        (s + l, s + r)
+    }
+
+    /// Skip-table entries of `page`
+    pub fn page_skip(&self, page: usize) -> &[u32] {
+        let per_page = self.bucket_size.div_ceil(SKIP);
+        self.page_skip
+            .get(page * per_page..(page + 1) * per_page)
+            .unwrap_or_default()
+    }
+
+    /// First step of [`Self::page_range`]: the `SKIP`-sized blocks of `page` that can
+    /// hold peptide indices `lo..=hi`
+    pub fn page_blocks(&self, page: usize, lo: usize, hi: usize) -> (usize, usize) {
         let start = page * self.bucket_size;
         let end = ((page + 1) * self.bucket_size).min(self.fragments.len());
         let per_page = self.bucket_size.div_ceil(SKIP);
@@ -581,13 +602,7 @@ impl IndexedDatabase {
             }
             None => (start, end),
         };
-        let (l, r) = binary_search_slice(
-            &self.fragments[s..e],
-            |frag, bound| (frag.peptide_index.0 as usize).cmp(bound),
-            lo,
-            hi,
-        );
-        (s + l, s + r)
+        (s, e)
     }
 
     /// Create a new [`IndexedQuery`] for a specific [`ProcessedSpectrum`]
@@ -725,6 +740,22 @@ impl IndexedQuery<'_> {
             })
         })
     }
+}
+
+/// Ask the CPU to start loading `data` into cache (no-op off x86-64)
+#[inline(always)]
+pub fn prefetch<T>(data: &[T]) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+        let p = data.as_ptr() as *const i8;
+        for offset in (0..std::mem::size_of_val(data)).step_by(64) {
+            // SAFETY: prefetching is a hint and never faults; the address is in `data`
+            unsafe { _mm_prefetch::<_MM_HINT_T0>(p.add(offset)) };
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = data;
 }
 
 /// Return the widest `left` and `right` indices into a `slice` (sorted by the
