@@ -12,6 +12,15 @@ use rayon::prelude::*;
 
 /// Try to fit a retention time prediction model
 pub fn predict(db: &IndexedDatabase, features: &mut [Feature]) -> Option<()> {
+    // No ion mobility at all (Orbitrap mzML, MGF): nothing to model. Report a zero
+    // prediction and residual, as the model fitted to all-zero mobilities used to
+    if !features.iter().any(|f| f.ims > 0.0) {
+        features.par_iter_mut().for_each(|feat| {
+            feat.predicted_ims = 0.0;
+            feat.delta_ims_model = 0.0;
+        });
+        return None;
+    }
     // Training LR might fail - not enough values, or r-squared is < 0.7
     let lr = match MobilityModel::fit(db, features) {
         Some(lr) => lr,
@@ -200,6 +209,31 @@ impl MobilityModel {
 mod test {
     use super::*;
     use crate::enzyme::Digest;
+
+    #[test]
+    fn input_without_mobility_reports_zero_residuals() {
+        let fasta = crate::fasta::Fasta::parse(
+            include_str!("../../../../tests/Q99536.fasta").into(),
+            "rev_",
+            true,
+        );
+        let mut builder = crate::database::Builder::default();
+        builder.update_fasta("unused".into());
+        let db = builder.make_parameters().build(fasta);
+        let mut features = (0..db.peptides.len())
+            .map(|ix| Feature {
+                peptide_idx: crate::database::PeptideIx(ix as u32),
+                charge: 2,
+                label: 1,
+                delta_ims_model: 0.999,
+                ..Default::default()
+            })
+            .collect::<Vec<_>>();
+        assert!(predict(&db, &mut features).is_none());
+        assert!(features
+            .iter()
+            .all(|f| f.delta_ims_model == 0.0 && f.predicted_ims == 0.0));
+    }
 
     #[test]
     fn psms_without_mobility_do_not_train_the_model() {
