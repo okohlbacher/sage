@@ -39,8 +39,9 @@ sage-core = { path = "../sage" }
 parquet = { version = "50.0.0", optional = true, default-features = false, features = ["zstd"] }
 # mzPeak input through the HUPO-PSI reference reader. Needs its `bruker` feature off
 # (it would pull a second SQLite build next to timsrust's); that switch is not upstream
-# yet, hence the local checkout (branch optional-bruker)
-mzpeak_prototyping = { path = "../../../../../../mzPeak OpenMS/hupo-mzpeak", default-features = false, optional = true }
+# yet: pinned to branch optional-bruker (tag sage-pin) of the local HUPO-PSI/mzPeak
+# checkout until it is merged (backlog: work/BACKLOG.md)
+mzpeak_prototyping = { git = "file:///Users/kohlbach/Claude/mzPeak%20OpenMS/hupo-mzpeak", rev = "bfec73a2129efee970cd60b73e532dc9f9998ebb", default-features = false, optional = true }
 mzdata = { version = "0.67.1", default-features = false, optional = true }
 
 [features]
