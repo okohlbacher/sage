@@ -121,31 +121,31 @@ impl<Ix: Default + Send> Competition<Ix> {
 }
 
 pub fn picked_peptide(db: &IndexedDatabase, features: &mut [Feature]) -> usize {
-    // formatting the keys dominates; build them in parallel, insert them in order (the
-    // last feature of a key sets its `*_ix`)
-    let keys = features
-        .par_iter()
-        .map(|feat| {
-            let peptide = &db[feat.peptide_idx];
-            // Only reverse the peptide sequence if we generated decoys ourselves
-            match db.generate_decoys && peptide.decoy {
-                true => peptide.reverse().to_string(),
-                false => peptide.to_string(),
-            }
-        })
-        .collect::<Vec<_>>();
-    let mut map: FnvHashMap<String, Competition<PeptideIx>> = FnvHashMap::default();
-    for (feat, key) in features.iter().zip(keys) {
+    // formatting the keys dominates; build them in parallel (in bounded batches), insert
+    // them in order (the last feature of a key sets its `*_ix`)
+    let key = |feat: &Feature| {
         let peptide = &db[feat.peptide_idx];
-        let entry = map.entry(key).or_default();
-        match peptide.decoy {
-            true => {
-                entry.reverse = entry.reverse.max(feat.discriminant_score);
-                entry.reverse_ix = Some(feat.peptide_idx);
-            }
-            false => {
-                entry.forward = entry.forward.max(feat.discriminant_score);
-                entry.foward_ix = Some(feat.peptide_idx);
+        // Only reverse the peptide sequence if we generated decoys ourselves
+        match db.generate_decoys && peptide.decoy {
+            true => peptide.reverse().to_string(),
+            false => peptide.to_string(),
+        }
+    };
+    let mut map: FnvHashMap<String, Competition<PeptideIx>> = FnvHashMap::default();
+    for batch in features.chunks(1 << 16) {
+        let keys = batch.par_iter().map(key).collect::<Vec<_>>();
+        for (feat, key) in batch.iter().zip(keys) {
+            let peptide = &db[feat.peptide_idx];
+            let entry = map.entry(key).or_default();
+            match peptide.decoy {
+                true => {
+                    entry.reverse = entry.reverse.max(feat.discriminant_score);
+                    entry.reverse_ix = Some(feat.peptide_idx);
+                }
+                false => {
+                    entry.forward = entry.forward.max(feat.discriminant_score);
+                    entry.foward_ix = Some(feat.peptide_idx);
+                }
             }
         }
     }

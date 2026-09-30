@@ -505,15 +505,22 @@ fn dda_frames_once<T: Send>(
     let mut seen = std::collections::HashSet::new();
     let mut block_start = 0;
     for (ix, group) in groups.iter().enumerate() {
-        let new = pasef[group.clone()]
+        let mut new = pasef[group.clone()]
             .iter()
-            .filter(|p| !seen.contains(&p.frame))
-            .count();
-        if ix > block_start && (ix - block_start == MAX_SPECTRA || seen.len() + new > MAX_FRAMES) {
+            .map(|p| p.frame)
+            .filter(|frame| !seen.contains(frame))
+            .collect::<Vec<_>>();
+        new.sort_unstable();
+        new.dedup();
+        if ix > block_start
+            && (ix - block_start == MAX_SPECTRA || seen.len() + new.len() > MAX_FRAMES)
+        {
             blocks.push(block_start..ix);
             block_start = ix;
             seen.clear();
         }
+        // ponytail: a single spectrum spanning more frames than the limit is one block
+        // (its frames are needed together anyway); DDA precursors span a few frames
         seen.extend(pasef[group.clone()].iter().map(|p| p.frame));
     }
     blocks.push(block_start..groups.len());

@@ -157,9 +157,11 @@ pub fn most_intense_peak_from(
     tolerance: Tolerance,
     cursor: &mut Option<usize>,
 ) -> Option<usize> {
+    // `+ 0.0` as the offset in `select_most_intense_peak` (turns -0.0 into +0.0)
     let (lo, hi) = tolerance.bounds(center);
+    let (lo, hi) = (lo + 0.0, hi + 0.0);
     // first index whose mass is not < lo (the `partition_point` of the binary search)
-    let mut i = match *cursor {
+    let i = match *cursor {
         None => masses.partition_point(|m| m.total_cmp(&lo) == std::cmp::Ordering::Less),
         Some(mut i) => {
             while i > 0 && masses[i - 1].total_cmp(&lo) != std::cmp::Ordering::Less {
@@ -172,6 +174,9 @@ pub fn most_intense_peak_from(
         }
     };
     *cursor = Some(i);
+    // like `binary_search_slice`, start one below: in total order -0.0 < +0.0, but the
+    // IEEE bounds check below accepts it
+    let mut i = i.saturating_sub(1);
     let mut best_peak = None;
     let mut max_int = 0.0;
     while i < masses.len() && masses[i].total_cmp(&hi) != std::cmp::Ordering::Greater {
@@ -602,6 +607,16 @@ mod test {
         let jumpy = (0..400)
             .map(|i| 90.0 + ((i * 7919) % 400) as f32 * 5.1)
             .collect::<Vec<f32>>();
+        // signed zeros (total order vs IEEE)
+        let zeros = [-0.0f32, 0.0];
+        let z_int = [2.0f32, 1.0];
+        for c in [0.0f32, -0.0] {
+            let mut cursor = None;
+            assert_eq!(
+                most_intense_peak_from(&zeros, &z_int, c, Tolerance::Da(0.0, 0.0), &mut cursor),
+                select_most_intense_peak(&zeros, &z_int, c, Tolerance::Da(0.0, 0.0), None)
+            );
+        }
         for centers in [up, down, jumpy] {
             let mut cursor = None;
             for &c in &centers {

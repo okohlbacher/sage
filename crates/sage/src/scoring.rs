@@ -925,8 +925,9 @@ impl<'db> Scorer<'db> {
 
         let mut fragments_details = Fragments::default();
 
-        // Ions of one series (and charge) are monotone in m/z: keep a cursor into the
-        // sorted peaks per charge instead of binary-searching each ion
+        // Ions of one series (and charge) are usually monotone in m/z (not with negative
+        // modification masses; the cursor then moves back): keep a cursor into the sorted
+        // peaks per charge instead of binary-searching each ion
         let mut cursors = [None::<usize>; 8];
         let mut series = None;
 
