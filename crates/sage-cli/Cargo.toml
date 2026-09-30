@@ -18,6 +18,10 @@ path = "src/lib.rs"
 name = "sage"
 path = "src/main.rs"
 
+[features]
+# mzPeak input (HUPO-PSI reference reader)
+mzpeak = ["sage-cloudpath/mzpeak"]
+
 [dependencies]
 mimalloc = { version = "0.1", default-features = false }
 sage-core = { path = "../sage" }

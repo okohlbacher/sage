@@ -9,6 +9,7 @@ pub enum FileFormat {
     MzML,
     MGF,
     TDF,
+    MzPeak,
     Unidentified,
 }
 
@@ -23,7 +24,17 @@ impl FileFormat {
             FileFormat::MzML => false,
             FileFormat::MGF => false,
             FileFormat::TDF => true,
+            FileFormat::MzPeak => false,
             FileFormat::Unidentified => false,
+        }
+    }
+
+    /// Can this build read the format? (mzPeak needs the `mzpeak` feature)
+    pub fn supported(&self) -> bool {
+        match self {
+            FileFormat::MzPeak => cfg!(feature = "mzpeak"),
+            FileFormat::Unidentified => false,
+            _ => true,
         }
     }
 }
@@ -35,6 +46,11 @@ impl From<&str> for FileFormat {
         let path_lower = path.to_lowercase();
         if path_lower.ends_with(".mgf.gz") || path_lower.ends_with(".mgf") {
             FileFormat::MGF
+        } else if path_lower
+            .trim_end_matches(std::path::MAIN_SEPARATOR)
+            .ends_with(".mzpeak")
+        {
+            FileFormat::MzPeak
         } else if is_bruker(&path_lower) {
             FileFormat::TDF
         } else if path_lower.ends_with(".mzml.gz") || path_lower.ends_with(".mzml") {
@@ -70,7 +86,35 @@ pub fn read_spectra(
         FileFormat::MzML => read_mzml_levels(url, file_id, sn, !requires_ms1),
         FileFormat::MGF => read_mgf(url, file_id),
         FileFormat::TDF => read_tdf(url, file_id, bruker_processor, requires_ms1),
+        FileFormat::MzPeak => read_mzpeak(url, file_id, requires_ms1),
         FileFormat::Unidentified => Err(Error::UnsupportedFormat(url.to_string())),
+    }
+}
+
+/// mzPeak via the HUPO-PSI reference reader (feature `mzpeak`). Local files are read
+/// with random access; remote objects are fetched whole (ZIP and parquet need seeking).
+pub fn read_mzpeak(url: &Url, file_id: usize, requires_ms1: bool) -> Result<Vec<RawSpectrum>, Error> {
+    #[cfg(feature = "mzpeak")]
+    {
+        use mzpeak_prototyping::MzPeakReader;
+        let reader = if url.scheme() == "file" {
+            MzPeakReader::new(url.to_file_path().map_err(|_| Error::InvalidUri)?)?
+        } else {
+            let bytes = read_and_execute(url, |mut bf| async move {
+                let mut buf = Vec::new();
+                bf.read_to_end(&mut buf).await?;
+                Ok(buf)
+            })?;
+            MzPeakReader::from_buf(bytes.into())?
+        };
+        Ok(crate::mzpeak::read(reader, file_id, requires_ms1))
+    }
+    #[cfg(not(feature = "mzpeak"))]
+    {
+        let _ = (file_id, requires_ms1);
+        Err(Error::UnsupportedFormat(format!(
+            "{url} (mzPeak support is not compiled in; build with --features mzpeak)"
+        )))
     }
 }
 
@@ -254,5 +298,8 @@ mod test {
             FileFormat::MzML
         );
         assert_eq!(FileFormat::from("foo.mzXML"), FileFormat::Unidentified);
+        assert_eq!(FileFormat::from("foo.mzpeak"), FileFormat::MzPeak);
+        assert_eq!(FileFormat::from("./foo.unpacked.mzpeak/"), FileFormat::MzPeak);
+        assert_eq!(FileFormat::MzPeak.supported(), cfg!(feature = "mzpeak"));
     }
 }

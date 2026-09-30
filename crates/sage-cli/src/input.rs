@@ -325,15 +325,12 @@ impl Input {
         // Fail before the (possibly long) database build, not halfway through the run
         let unsupported = mzml_paths
             .iter()
-            .filter(|url| {
-                sage_cloudpath::FileFormat::from(url.as_str())
-                    == sage_cloudpath::FileFormat::Unidentified
-            })
+            .filter(|url| !sage_cloudpath::FileFormat::from(url.as_str()).supported())
             .map(|url| url.to_string())
             .collect::<Vec<_>>();
         if !unsupported.is_empty() {
             anyhow::bail!(
-                "unsupported input file format (expected .mzML[.gz], .mgf[.gz] or a Bruker .d): {}",
+                "unsupported input file format (expected .mzML[.gz], .mgf[.gz], .mzpeak (feature `mzpeak`) or a Bruker .d): {}",
                 unsupported.join(", ")
             );
         }

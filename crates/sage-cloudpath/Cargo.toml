@@ -37,6 +37,14 @@ serde_json = "1.0"
 
 sage-core = { path = "../sage" }
 parquet = { version = "50.0.0", optional = true, default-features = false, features = ["zstd"] }
+# mzPeak input through the HUPO-PSI reference reader. Needs its `bruker` feature off
+# (it would pull a second SQLite build next to timsrust's); that switch is not upstream
+# yet, hence the local checkout (branch optional-bruker)
+mzpeak_prototyping = { path = "../../../../../../mzPeak OpenMS/hupo-mzpeak", default-features = false, optional = true }
+mzdata = { version = "0.67.1", default-features = false, optional = true }
+
+[features]
+mzpeak = ["dep:mzpeak_prototyping", "dep:mzdata"]
 
 [dev-dependencies]
 flate2 = "1"
