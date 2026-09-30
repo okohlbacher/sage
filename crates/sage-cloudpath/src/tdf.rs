@@ -523,6 +523,15 @@ fn dda_frames_once(
                 let (tof, intensity) = group_and_sum(tof, intensity);
                 let intensity = smooth(&tof, intensity, smoothing);
                 let keep = local_maxima(&tof, &intensity, centroiding);
+                // exact-size peak arrays: spectra are kept for the whole run, and a
+                // collected `filter` would carry up to 2x spare capacity
+                let kept = keep.iter().filter(|&&k| k).count();
+                let mut mz = Vec::with_capacity(kept);
+                let mut int = Vec::with_capacity(kept);
+                for i in (0..tof.len()).filter(|&i| keep[i]) {
+                    mz.push(mz_converter.convert(tof[i]) as f32);
+                    int.push(intensity[i] as f64 as f32);
+                }
                 let tims_precursor = precursors.get(index).unwrap();
                 let rt = tims_precursor.rt;
                 let mut precursor = TdfReader::parse_precursor(tims_precursor);
@@ -537,20 +546,10 @@ fn dda_frames_once(
                     scan_start_time: rt as f32 / 60.0,
                     ion_injection_time: f32::NAN,
                     total_ion_current: 0.0,
-                    mz: tof
-                        .iter()
-                        .zip(&keep)
-                        .filter(|(_, &k)| k)
-                        .map(|(&t, _)| mz_converter.convert(t) as f32)
-                        .collect(),
+                    mz,
                     ms_level: 2,
                     id: index.to_string(),
-                    intensity: intensity
-                        .iter()
-                        .zip(&keep)
-                        .filter(|(_, &k)| k)
-                        .map(|(&x, _)| x as f64 as f32)
-                        .collect(),
+                    intensity: int,
                     mobility: None,
                 }
             })
