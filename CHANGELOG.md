@@ -10,7 +10,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `database.max_combinations` to cap the number of peptide variants (including the unmodified form) generated from variable modifications, preferring variants with fewer modifications.
 
 ### Changed
-- Performance: about 2.8-3.4x faster end to end and ~2 GB lower peak memory on a 3-file timsTOF DDA benchmark (human, 7.7 M peptides), with identical identifications. Isotope windows share one fragment lookup, a per-page skip table narrows fragment lookups, KDE fits parallelise over bins, the fragment index is built in one exact-size allocation on transparent huge pages, digest grouping is parallel, spectra are processed per file, the database build overlaps with reading the first batch, the database is not freed at exit, and mimalloc is the global allocator.
+- Performance: about 4.6-5.8x faster end to end (128/64/16 threads: 35.1/41.7/88.7 s -> 7.6/7.2/15.3 s) and 2.2-3.6 GiB lower peak memory on a 3-file timsTOF DDA benchmark (human, 7.7 M peptides), with identical identifications. Isotope windows share one fragment lookup, a per-page skip table narrows fragment lookups, lookups are pipelined with software prefetch, full rescoring walks the peaks with a cursor instead of a binary search per ion, KDE fits parallelise over bins, the fragment index is built in one exact-size allocation on transparent huge pages, digest grouping is parallel, spectra are processed per file, the database build overlaps with reading the first batch, the database is not freed at exit, output is serialized in parallel, and mimalloc is the global allocator. Bruker DDA: each MS2 frame is decoded once per block of spectra (timsrust decoded it once per precursor, ~9 times), frames are read without a memory map, spectra are processed while the file is read, and up to 4 `.d` files are read at a time.
+- mimalloc trades memory for speed at high thread counts; `MIMALLOC_ARENA_EAGER_COMMIT=0` lowers peak memory (by ~1.5 GB at 128 threads in the benchmark) for ~10% more time.
+- Output is deterministic: identical searches give byte-identical result and PIN files, also across thread counts. `psm_id` is the row number of the output (it was a counter shared by the parallel search).
 - mzML: MS1 spectra are no longer decoded or kept unless LFQ is enabled.
 - A file that cannot be read completely (I/O error, truncated or corrupt mzML/MGF, unreadable Bruker frames) now fails the run with an error naming the file, instead of being searched partially or skipped with exit code 0. Unsupported file formats are rejected before the database is built.
 - `posterior_error` now reports the PEP of a target PSM (min(1, p/(1-p))); it used to report the probability of being a decoy, which is ~2x too optimistic for low-scoring PSMs. It is 0 (PEP = 1) when the LDA falls back to the heuristic score. q-values are unchanged.
@@ -18,7 +20,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - An `enzyme` block without `cleave_at` keeps trypsin's `restrict: "P"` default (e.g. `{"missed_cleavages": 2}` used to cleave before P).
 - MGF spectra listing several charges (`CHARGE=2+ and 3+`) are searched at every listed charge (only the first was searched).
 - The logged "target peptide-spectrum matches" count no longer includes passing decoys.
-- FASTA sequences are upper-cased and a terminal `*` is removed; empty headers get `unnamed_protein_<n>`.
+- FASTA sequences are upper-cased and a terminal `*` is removed; empty headers get `unnamed_protein_<n>` (renamed if a record is explicitly called that).
+- MGF: a nested `BEGIN IONS`, a stray `END IONS` or a corrupt intensity fails the file; lines between blocks are ignored (they used to be parsed into the next spectrum); file-level `CHARGE`/`TOL` apply to the first spectrum too; a leading byte-order mark is ignored; a file with content but no block warns.
+- Deisotoping uses the highest precursor charge of a spectrum (unknown counting as 3), independent of the order of listed charges.
+- The ion mobility model ignores PSMs without a measured mobility (e.g. mzML next to `.d` files) and gives them the median residual.
 - Output file names are percent-decoded (`my file.mzML`, not `my%20file.mzML`).
 
 ### Fixed
@@ -29,6 +34,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `isotope_errors: [n, n]` with n != 0 searched isotope 0.
 - Files without retention times (MGF without RTINSECONDS) disabled LDA rescoring for the whole run and distorted RT alignment and the RT model of the other files.
 - Bruker `ion_injection_time` reported the retention time.
+- mzML: scan-level ion mobility applies to every precursor of a spectrum, and isolation windows no longer carry over from one precursor to the next.
+- HTML report: no abort when a discriminant score is not finite.
+- Non-finite peaks are dropped from spectra with an ion mobility array too.
 
 ## [v0.15.0]
 ### Added
