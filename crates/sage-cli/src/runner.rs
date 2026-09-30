@@ -573,6 +573,7 @@ impl Runner {
             q_protein_group
         );
         log::trace!("writing outputs");
+        let output_start = Instant::now();
 
         // Write either a single parquet file, or multiple tsv files
         if parquet {
@@ -644,6 +645,7 @@ impl Runner {
             )?);
         }
 
+        info!("- output: {:8} ms", output_start.elapsed().as_millis());
         let path = self.make_path("results.json");
         println!("{}", serde_json::to_string_pretty(&self.parameters)?);
 
