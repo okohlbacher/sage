@@ -684,10 +684,22 @@ impl<'db> Scorer<'db> {
         report_psms: usize,
         features: &mut Vec<Feature>,
     ) {
-        let mut score_vector = hits
-            .preliminary
-            .iter()
-            .filter(|score| score.peptide != PeptideIx::default())
+        // Rescoring a candidate starts with a few dependent cache misses (the peptide,
+        // then its sequence and modifications); request them for all candidates first
+        let candidates = || {
+            hits.preliminary
+                .iter()
+                .filter(|score| score.peptide != PeptideIx::default())
+        };
+        for pre in candidates() {
+            prefetch(std::slice::from_ref(&self.db[pre.peptide]));
+        }
+        for pre in candidates() {
+            let peptide = &self.db[pre.peptide];
+            prefetch(&peptide.sequence[..]);
+            prefetch(&peptide.modifications[..]);
+        }
+        let mut score_vector = candidates()
             .map(|pre| self.score_candidate(query, pre))
             .filter(|s| (s.0.matched_b + s.0.matched_y) >= self.min_matched_peaks)
             .collect::<Vec<_>>();
