@@ -7,11 +7,21 @@ use mzpeak_prototyping::MzPeakReader;
 use sage_core::mass::Tolerance;
 use sage_core::spectrum::{Precursor, RawSpectrum, Representation};
 
-/// All spectra of an mzPeak reader; MS1 only if `keep_ms1` (LFQ)
+/// All spectra of an mzPeak reader; MS1 only if `keep_ms1` (LFQ). MS1 spectra are
+/// skipped by their metadata, before their peaks are loaded.
 pub fn read(mut reader: MzPeakReader, file_id: usize, keep_ms1: bool) -> Vec<RawSpectrum> {
-    reader
-        .iter()
-        .filter(|s| keep_ms1 || s.ms_level() != 1)
+    let wanted = match reader.load_all_spectrum_metadata() {
+        Ok(Some(meta)) if !keep_ms1 => meta
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| m.ms_level != 1)
+            .map(|(ix, _)| ix)
+            .collect::<Vec<_>>(),
+        _ => (0..reader.len()).collect(),
+    };
+    wanted
+        .into_iter()
+        .filter_map(|ix| reader.get_spectrum(ix))
         .map(|s| to_raw(&s, file_id))
         .collect()
 }
