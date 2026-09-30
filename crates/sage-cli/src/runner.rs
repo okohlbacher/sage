@@ -394,33 +394,24 @@ impl Runner {
             .iter()
             .all(|path| FileFormat::from(path.as_ref()).within_file_parallel());
         log::trace!("file serial read: {}", file_serial_read);
-        let inner_closure = |(idx, path)| {
+        // Process spectra while each file is read, so the raw (unfiltered) peak lists of
+        // only the files currently being read are alive (for .d files: of one block of
+        // spectra), not those of the whole batch (by default num_cpus/2 files).
+        let read_and_process = |(idx, path): (usize, &Url)| -> anyhow::Result<Spectra> {
             let file_id = chunk_idx * batch_size + idx;
-            let res = sage_cloudpath::util::read_spectra(
+            let res = sage_cloudpath::util::read_processed(
                 path,
                 file_id,
                 sn,
                 self.parameters.bruker_config,
                 self.requires_ms1(),
+                |s| sp.process(s),
             );
-
             // An unreadable or truncated file must fail the run: silently searching the
             // remaining files would report results that look complete but are not.
             let s = res.with_context(|| format!("failed to read spectra from `{}`", path))?;
             log::trace!("- {}: read {} spectra", path, s.len());
-            anyhow::Ok(s)
-        };
-
-        // Process each file's spectra as soon as that file is read, so the raw
-        // (unfiltered) peak lists of only the files currently being read are alive,
-        // not those of the whole batch (by default num_cpus/2 files).
-        let read_and_process = |item| -> anyhow::Result<Spectra> {
-            let raw = inner_closure(item)?;
-            let (ms1, msn): (Vec<_>, Vec<_>) = raw.into_par_iter().partition(|s| s.ms_level == 1);
-            Ok((
-                ms1.into_par_iter().map(|s| sp.process(s)).collect(),
-                msn.into_par_iter().map(|s| sp.process(s)).collect(),
-            ))
+            Ok(s.into_par_iter().partition(|s| s.level == 1))
         };
         let per_file = if file_serial_read {
             chunk

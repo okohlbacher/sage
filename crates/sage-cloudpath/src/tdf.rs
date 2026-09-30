@@ -32,14 +32,16 @@ pub struct BrukerProcessingConfig {
 }
 
 impl TdfReader {
-    pub fn parse(
+    /// Spectra of a .d file, each passed through `f` (see [`crate::util::read_processed`])
+    pub fn parse<T: Send>(
         &self,
         path_name: impl AsRef<Path>,
         file_id: usize,
         config: BrukerProcessingConfig,
         requires_ms1: bool,
-    ) -> Result<Vec<RawSpectrum>, timsrust::TimsRustError> {
-        let mut spectra = match dda_frames_once(path_name.as_ref(), file_id, config.ms2) {
+        f: impl Fn(RawSpectrum) -> T + Sync,
+    ) -> Result<Vec<T>, timsrust::TimsRustError> {
+        let mut spectra = match dda_frames_once(path_name.as_ref(), file_id, config.ms2, &f) {
             Some(spectra) => spectra?,
             None => {
                 let spectrum_reader = timsrust::readers::SpectrumReader::build()
@@ -47,11 +49,14 @@ impl TdfReader {
                     .with_config(config.ms2)
                     .finalize()?;
                 self.read_msn_spectra(file_id, &spectrum_reader)?
+                    .into_par_iter()
+                    .map(&f)
+                    .collect()
             }
         };
         if requires_ms1 {
             let ms1s = self.read_ms1_spectra(&path_name, file_id, config.ms1)?;
-            spectra.extend(ms1s);
+            spectra.extend(ms1s.into_iter().map(&f));
         }
 
         Ok(spectra)
@@ -424,11 +429,12 @@ struct PasefEntry {
 /// PASEF MS2 frame holds ~9 precursors, so every MS2 frame was decompressed ~9 times.
 /// Returns `None` where this does not apply (not DDA-PASEF, calibration requested, an
 /// unexpected table): the caller then uses timsrust's reader.
-fn dda_frames_once(
+fn dda_frames_once<T: Send>(
     path: &Path,
     file_id: usize,
     config: TimsrustSpectrumConfig,
-) -> Option<Result<Vec<RawSpectrum>, timsrust::TimsRustError>> {
+    f: &(impl Fn(RawSpectrum) -> T + Sync),
+) -> Option<Result<Vec<T>, timsrust::TimsRustError>> {
     use timsrust::readers::{FrameReader, MetadataReader, PrecursorReader, TimsTofPath};
     if config.spectrum_processing_params.calibrate {
         return None;
@@ -539,7 +545,7 @@ fn dda_frames_once(
                     -isolation_width as f32 / 2.0,
                     isolation_width as f32 / 2.0,
                 ));
-                RawSpectrum {
+                f(RawSpectrum {
                     file_id,
                     precursors: vec![precursor],
                     representation: Representation::Centroid,
@@ -551,7 +557,7 @@ fn dda_frames_once(
                     id: index.to_string(),
                     intensity: int,
                     mobility: None,
-                }
+                })
             })
             .collect::<Vec<_>>();
         spectra.extend(block_spectra);

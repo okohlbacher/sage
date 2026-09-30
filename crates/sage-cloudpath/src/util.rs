@@ -99,19 +99,53 @@ pub fn read_mzml_levels(
     })
 }
 
+/// [`read_spectra`], then `f` applied to every spectrum. For Bruker .d files `f` runs
+/// while the file is read, so only a block of unprocessed spectra is alive at a time
+/// instead of the whole file's (~1.5 GB for a 60 min ddaPASEF run).
+pub fn read_processed<T: Send>(
+    url: &Url,
+    file_id: usize,
+    sn: Option<u8>,
+    bruker_processor: BrukerProcessingConfig,
+    requires_ms1: bool,
+    f: impl Fn(RawSpectrum) -> T + Sync,
+) -> Result<Vec<T>, Error> {
+    use rayon::prelude::*;
+    match FileFormat::from(url.as_ref()) {
+        FileFormat::TDF => read_tdf_with(url, file_id, bruker_processor, requires_ms1, f),
+        _ => Ok(
+            read_spectra(url, file_id, sn, bruker_processor, requires_ms1)?
+                .into_par_iter()
+                .map(&f)
+                .collect(),
+        ),
+    }
+}
+
 pub fn read_tdf(
     url: &Url,
     file_id: usize,
     bruker_spectrum_processor: BrukerProcessingConfig,
     requires_ms1: bool,
 ) -> Result<Vec<RawSpectrum>, Error> {
+    read_tdf_with(url, file_id, bruker_spectrum_processor, requires_ms1, |s| s)
+}
+
+fn read_tdf_with<T: Send>(
+    url: &Url,
+    file_id: usize,
+    bruker_spectrum_processor: BrukerProcessingConfig,
+    requires_ms1: bool,
+    f: impl Fn(RawSpectrum) -> T + Sync,
+) -> Result<Vec<T>, Error> {
     if url.scheme() != "file" {
         log::error!("Bruker files must be local: {}", url);
         return Err(Error::InvalidUri);
     }
 
     let path = url.to_file_path().map_err(|_| Error::InvalidUri)?;
-    let res = crate::tdf::TdfReader.parse(&path, file_id, bruker_spectrum_processor, requires_ms1);
+    let res =
+        crate::tdf::TdfReader.parse(&path, file_id, bruker_spectrum_processor, requires_ms1, f);
     match res {
         Ok(t) => Ok(t),
         Err(e) => Err(Error::TDF(e)),
