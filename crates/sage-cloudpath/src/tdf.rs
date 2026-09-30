@@ -427,12 +427,16 @@ struct RawFrame {
 /// file, one more for every file read at the same time). `None` for anything unusual;
 /// the caller then lets timsrust decode the frame.
 #[cfg(unix)]
-fn read_frame(bin: &std::fs::File, offset: u64) -> Option<RawFrame> {
+fn read_frame(bin: &std::fs::File, file_len: u64, offset: u64) -> Option<RawFrame> {
     use std::os::unix::fs::FileExt;
     let mut head = [0u8; 4];
     bin.read_exact_at(&mut head, offset).ok()?;
-    // the byte count includes an 8-byte header (byte count, scan count)
+    // the byte count includes an 8-byte header (byte count, scan count); a corrupt count
+    // must not allocate before the read fails
     let byte_count = u32::from_le_bytes(head) as usize;
+    if offset.checked_add(byte_count as u64)? > file_len {
+        return None;
+    }
     let mut data = vec![0u8; byte_count.checked_sub(8)?];
     bin.read_exact_at(&mut data, offset + 8).ok()?;
     let bytes = zstd::decode_all(&data[..]).ok()?;
@@ -476,7 +480,7 @@ fn read_frame(bin: &std::fs::File, offset: u64) -> Option<RawFrame> {
 }
 
 #[cfg(not(unix))]
-fn read_frame(_: &std::fs::File, _: u64) -> Option<RawFrame> {
+fn read_frame(_: &std::fs::File, _: u64, _: u64) -> Option<RawFrame> {
     None
 }
 
@@ -524,7 +528,8 @@ fn dda_frames_once<T: Send>(
     let bin = (metadata.compression_type == 2)
         .then(|| tims_path.tdf_bin().ok())
         .flatten()
-        .and_then(|bin| std::fs::File::open(bin).ok());
+        .and_then(|bin| std::fs::File::open(bin).ok())
+        .and_then(|bin| Some((bin.metadata().ok()?.len(), bin)));
     let precursors = PrecursorReader::build()
         .with_path(path)
         .with_config(config.frame_splitting_params)
@@ -611,10 +616,13 @@ fn dda_frames_once<T: Send>(
             .par_iter()
             .map(|&f| {
                 // (`get_binary_offset` indexes without a bounds check)
-                let read = bin.as_ref().filter(|_| f < frames.len()).and_then(|bin| {
-                    let offset = frames.get_binary_offset(f);
-                    read_frame(bin, offset as u64)
-                });
+                let read = bin
+                    .as_ref()
+                    .filter(|_| f < frames.len())
+                    .and_then(|(len, bin)| {
+                        let offset = frames.get_binary_offset(f);
+                        read_frame(bin, *len, offset as u64)
+                    });
                 match read {
                     Some(frame) => Ok(frame),
                     // anything unusual: timsrust decodes it (or reports the error)

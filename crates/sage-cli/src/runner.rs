@@ -415,20 +415,22 @@ impl Runner {
         };
         // Formats read in parallel within a file (.d) go a few files at a time: one file's
         // serial setup (SQL tables, frame index; ~0.2 s) overlaps another's parallel work
+        // (one at a time with LFQ: MS1 frames still go through timsrust's memory map and
+        // all raw MS1 spectra of a file are kept)
         let items = chunk.iter().enumerate().collect::<Vec<_>>();
-        let group = if file_serial_read {
-            4
-        } else {
-            items.len().max(1)
+        let group = match (file_serial_read, self.requires_ms1()) {
+            (true, false) => 4,
+            (true, true) => 1,
+            (false, _) => items.len().max(1),
         };
         let mut per_file = Vec::with_capacity(items.len());
         for files in items.chunks(group) {
-            per_file.extend(
-                files
-                    .par_iter()
-                    .map(|&item| read_and_process(item))
-                    .collect::<anyhow::Result<Vec<_>>>()?,
-            );
+            // errors in input order: the first failing file is reported
+            let results = files
+                .par_iter()
+                .map(|&item| read_and_process(item))
+                .collect::<Vec<_>>();
+            per_file.extend(results.into_iter().collect::<anyhow::Result<Vec<_>>>()?);
         }
         let (mut ms1_spectra, mut msn_spectra) = (Vec::new(), Vec::new());
         for (ms1, msn) in per_file {
