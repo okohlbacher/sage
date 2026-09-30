@@ -86,14 +86,19 @@ pub fn read_spectra(
         FileFormat::MzML => read_mzml_levels(url, file_id, sn, !requires_ms1),
         FileFormat::MGF => read_mgf(url, file_id),
         FileFormat::TDF => read_tdf(url, file_id, bruker_processor, requires_ms1),
-        FileFormat::MzPeak => read_mzpeak(url, file_id, requires_ms1),
+        FileFormat::MzPeak => read_mzpeak(url, file_id, sn, requires_ms1),
         FileFormat::Unidentified => Err(Error::UnsupportedFormat(url.to_string())),
     }
 }
 
 /// mzPeak via the HUPO-PSI reference reader (feature `mzpeak`). Local files are read
 /// with random access; remote objects are fetched whole (ZIP and parquet need seeking).
-pub fn read_mzpeak(url: &Url, file_id: usize, requires_ms1: bool) -> Result<Vec<RawSpectrum>, Error> {
+pub fn read_mzpeak(
+    url: &Url,
+    file_id: usize,
+    sn: Option<u8>,
+    requires_ms1: bool,
+) -> Result<Vec<RawSpectrum>, Error> {
     #[cfg(feature = "mzpeak")]
     {
         use mzpeak_prototyping::MzPeakReader;
@@ -107,11 +112,14 @@ pub fn read_mzpeak(url: &Url, file_id: usize, requires_ms1: bool) -> Result<Vec<
             })?;
             MzPeakReader::from_buf(bytes.into())?
         };
-        Ok(crate::mzpeak::read(reader, file_id, requires_ms1))
+        if sn.is_some() {
+            log::warn!("{url}: mzPeak files carry no noise arrays; TMT S/N is not computed");
+        }
+        Ok(crate::mzpeak::read(reader, file_id, requires_ms1)?)
     }
     #[cfg(not(feature = "mzpeak"))]
     {
-        let _ = (file_id, requires_ms1);
+        let _ = (file_id, sn, requires_ms1);
         Err(Error::UnsupportedFormat(format!(
             "{url} (mzPeak support is not compiled in; build with --features mzpeak)"
         )))
@@ -299,7 +307,10 @@ mod test {
         );
         assert_eq!(FileFormat::from("foo.mzXML"), FileFormat::Unidentified);
         assert_eq!(FileFormat::from("foo.mzpeak"), FileFormat::MzPeak);
-        assert_eq!(FileFormat::from("./foo.unpacked.mzpeak/"), FileFormat::MzPeak);
+        assert_eq!(
+            FileFormat::from("./foo.unpacked.mzpeak/"),
+            FileFormat::MzPeak
+        );
         assert_eq!(FileFormat::MzPeak.supported(), cfg!(feature = "mzpeak"));
     }
 }

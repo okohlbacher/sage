@@ -12,10 +12,10 @@ pub mod tdf;
 pub mod util;
 pub use util::FileFormat;
 
-#[cfg(feature = "parquet")]
-pub mod parquet;
 #[cfg(feature = "mzpeak")]
 pub mod mzpeak;
+#[cfg(feature = "parquet")]
+pub mod parquet;
 
 /// Schemes recognized by `object_store::parse_url_opts`. Anything outside
 /// this set — most importantly Windows drive letters like `C:` which parse
@@ -182,7 +182,9 @@ pub enum Error {
     TDF(#[from] timsrust::TimsRustError),
     #[error("MGF error: {0}")]
     MGF(#[from] mgf::MgfError),
-    #[error("unsupported file format: {0} (expected .mzML[.gz], .mgf[.gz], .mzpeak or a Bruker .d)")]
+    #[error(
+        "unsupported file format: {0} (expected .mzML[.gz], .mgf[.gz], .mzpeak or a Bruker .d)"
+    )]
     UnsupportedFormat(String),
 }
 
