@@ -433,8 +433,11 @@ fn read_frame(bin: &std::fs::File, file_len: u64, offset: u64) -> Option<RawFram
     bin.read_exact_at(&mut head, offset).ok()?;
     // the byte count includes an 8-byte header (byte count, scan count); a corrupt count
     // must not allocate before the read fails
+    // ponytail: real compressed frames are a few MB; a larger count is left to timsrust,
+    // which reads through its map instead of allocating a copy
+    const MAX_FRAME_BYTES: usize = 64 << 20;
     let byte_count = u32::from_le_bytes(head) as usize;
-    if offset.checked_add(byte_count as u64)? > file_len {
+    if byte_count > MAX_FRAME_BYTES || offset.checked_add(byte_count as u64)? > file_len {
         return None;
     }
     let mut data = vec![0u8; byte_count.checked_sub(8)?];
