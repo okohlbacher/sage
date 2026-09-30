@@ -121,15 +121,22 @@ impl<Ix: Default + Send> Competition<Ix> {
 }
 
 pub fn picked_peptide(db: &IndexedDatabase, features: &mut [Feature]) -> usize {
+    // formatting the keys dominates; build them in parallel, insert them in order (the
+    // last feature of a key sets its `*_ix`)
+    let keys = features
+        .par_iter()
+        .map(|feat| {
+            let peptide = &db[feat.peptide_idx];
+            // Only reverse the peptide sequence if we generated decoys ourselves
+            match db.generate_decoys && peptide.decoy {
+                true => peptide.reverse().to_string(),
+                false => peptide.to_string(),
+            }
+        })
+        .collect::<Vec<_>>();
     let mut map: FnvHashMap<String, Competition<PeptideIx>> = FnvHashMap::default();
-    for feat in features.iter() {
+    for (feat, key) in features.iter().zip(keys) {
         let peptide = &db[feat.peptide_idx];
-        // Only reverse the peptide sequence if we generated decoys ourselves
-        let key = match db.generate_decoys && peptide.decoy {
-            true => peptide.reverse().to_string(),
-            false => peptide.to_string(),
-        };
-
         let entry = map.entry(key).or_default();
         match peptide.decoy {
             true => {
