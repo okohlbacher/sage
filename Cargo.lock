@@ -2678,6 +2678,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "url",
+ "zstd",
 ]
 
 [[package]]

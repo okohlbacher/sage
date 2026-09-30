@@ -413,6 +413,73 @@ impl PeakBuffer {
     }
 }
 
+/// The peaks of one frame
+struct RawFrame {
+    scan_offsets: Vec<usize>,
+    tof_indices: Vec<u32>,
+    intensities: Vec<u32>,
+}
+
+/// A frame of `analysis.tdf_bin` (compression type 2) decoded exactly as timsrust 0.4.2
+/// does (`TdfBlobReader::get`, `FrameReader::get_from_compression_type_2`), but read with
+/// positioned reads: timsrust reads through a memory map, whose touched pages stay in the
+/// process's resident memory until the reader is dropped (~1 GB for a 60 min ddaPASEF
+/// file, one more for every file read at the same time). `None` for anything unusual;
+/// the caller then lets timsrust decode the frame.
+#[cfg(unix)]
+fn read_frame(bin: &std::fs::File, offset: u64) -> Option<RawFrame> {
+    use std::os::unix::fs::FileExt;
+    let mut head = [0u8; 4];
+    bin.read_exact_at(&mut head, offset).ok()?;
+    // the byte count includes an 8-byte header (byte count, scan count)
+    let byte_count = u32::from_le_bytes(head) as usize;
+    let mut data = vec![0u8; byte_count.checked_sub(8)?];
+    bin.read_exact_at(&mut data, offset + 8).ok()?;
+    let bytes = zstd::decode_all(&data[..]).ok()?;
+    if bytes.len() % 4 != 0 {
+        return None;
+    }
+    // values are stored as four byte planes
+    let n = bytes.len() / 4;
+    let get = |i: usize| {
+        (i < n).then(|| {
+            u32::from_le_bytes([bytes[i], bytes[i + n], bytes[i + 2 * n], bytes[i + 3 * n]])
+        })
+    };
+    let scan_count = get(0)? as usize;
+    if scan_count == 0 || scan_count > n {
+        return None;
+    }
+    let peak_count = (n - scan_count) / 2;
+    let mut scan_offsets = Vec::with_capacity(scan_count + 1);
+    scan_offsets.push(0);
+    for scan in 0..scan_count - 1 {
+        scan_offsets.push(scan_offsets[scan] + (get(scan + 1)? / 2) as usize);
+    }
+    scan_offsets.push(peak_count);
+    let intensities = (0..peak_count)
+        .map(|peak| get(scan_count + 1 + 2 * peak))
+        .collect::<Option<Vec<_>>>()?;
+    let mut tof_indices = Vec::with_capacity(peak_count);
+    for scan in 0..scan_count {
+        let mut sum = 0u32;
+        for peak in *scan_offsets.get(scan)?..*scan_offsets.get(scan + 1)? {
+            sum = sum.checked_add(get(scan_count + 2 * peak)?)?;
+            tof_indices.push(sum.checked_sub(1)?);
+        }
+    }
+    Some(RawFrame {
+        scan_offsets,
+        tof_indices,
+        intensities,
+    })
+}
+
+#[cfg(not(unix))]
+fn read_frame(_: &std::fs::File, _: u64) -> Option<RawFrame> {
+    None
+}
+
 /// One row of the PASEF table: a precursor's scan range in one MS2 frame
 struct PasefEntry {
     frame: usize,
@@ -451,7 +518,13 @@ fn dda_frames_once<T: Send>(
     if frames.get_acquisition() != timsrust::AcquisitionType::DDAPASEF {
         return None;
     }
-    let mz_converter = MetadataReader::new(path).ok()?.mz_converter;
+    let metadata = MetadataReader::new(path).ok()?;
+    let mz_converter = metadata.mz_converter;
+    // frames are read with positioned reads where possible (see `read_frame`)
+    let bin = (metadata.compression_type == 2)
+        .then(|| tims_path.tdf_bin().ok())
+        .flatten()
+        .and_then(|bin| std::fs::File::open(bin).ok());
     let precursors = PrecursorReader::build()
         .with_path(path)
         .with_config(config.frame_splitting_params)
@@ -536,7 +609,22 @@ fn dda_frames_once<T: Send>(
         needed.dedup();
         let decoded = match needed
             .par_iter()
-            .map(|&f| frames.get(f))
+            .map(|&f| {
+                // (`get_binary_offset` indexes without a bounds check)
+                let read = bin.as_ref().filter(|_| f < frames.len()).and_then(|bin| {
+                    let offset = frames.get_binary_offset(f);
+                    read_frame(bin, offset as u64)
+                });
+                match read {
+                    Some(frame) => Ok(frame),
+                    // anything unusual: timsrust decodes it (or reports the error)
+                    None => frames.get(f).map(|frame| RawFrame {
+                        scan_offsets: frame.scan_offsets,
+                        tof_indices: frame.tof_indices,
+                        intensities: frame.intensities,
+                    }),
+                }
+            })
             .collect::<Result<Vec<_>, _>>()
         {
             Ok(decoded) => decoded,
