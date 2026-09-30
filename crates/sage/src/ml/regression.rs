@@ -75,18 +75,20 @@ impl LinearRegression {
         embed: impl Fn(&T) -> [f64; D] + Sync,
         target: impl Fn(&T) -> f64 + Sync,
     ) -> Option<Self> {
+        // fixed chunks merged in order: the floating-point sums (and so the model) do
+        // not depend on how rayon happens to split the work between threads
         let acc = items
-            .par_iter()
-            .filter(|x| filter(x))
-            .fold(
-                || Acc::zero(D),
-                |mut acc, x| {
-                    let row = embed(x);
-                    acc.add_row(&row, target(x));
-                    acc
-                },
-            )
-            .reduce(|| Acc::zero(D), Acc::merge);
+            .par_chunks(4096)
+            .map(|chunk| {
+                let mut acc = Acc::zero(D);
+                for x in chunk.iter().filter(|x| filter(x)) {
+                    acc.add_row(&embed(x), target(x));
+                }
+                acc
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .fold(Acc::zero(D), Acc::merge);
 
         if acc.n == 0 {
             return None;
