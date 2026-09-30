@@ -6,6 +6,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 ### Added
+- mzPeak input (`.mzpeak`, optional cargo feature `mzpeak`): read through the HUPO-PSI reference reader (`mzpeak_prototyping`) and `mzdata`. Needs the reader built without its `bruker` feature (not upstream yet; local checkout of HUPO-PSI/mzPeak, branch `optional-bruker`). Results are identical to searching the same data as mzML. Grid-encoded timsTOF mzPeak files are not supported in this configuration.
 - Per-modification occurrence limits using `{"mass": <mass>, "max_count": <limit>}` entries in `database.variable_mods`; existing bare-mass entries remain supported.
 - `database.max_combinations` to cap the number of peptide variants (including the unmodified form) generated from variable modifications, preferring variants with fewer modifications.
 
