@@ -1,0 +1,8 @@
+This build of Sage includes the `mzpeak` feature: mzPeak files are read with the
+HUPO-PSI mzPeak reference reader (mzpeak_prototyping, https://github.com/HUPO-PSI/mzPeak),
+built from https://github.com/okohlbacher/mzPeak at commit bfec73a (branch optional-bruker),
+together with mzdata (Apache-2.0, https://github.com/mobiusklein/mzdata).
+
+Licence status: the mzPeak Rust crate does not yet carry a LICENSE file; the project's
+Python package is published under Apache-2.0. A licence file for the Rust crate has been
+requested upstream.

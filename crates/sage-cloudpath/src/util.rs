@@ -47,7 +47,7 @@ impl From<&str> for FileFormat {
         if path_lower.ends_with(".mgf.gz") || path_lower.ends_with(".mgf") {
             FileFormat::MGF
         } else if path_lower
-            .trim_end_matches(std::path::MAIN_SEPARATOR)
+            .trim_end_matches(['/', std::path::MAIN_SEPARATOR])
             .ends_with(".mzpeak")
         {
             FileFormat::MzPeak
@@ -64,15 +64,9 @@ impl From<&str> for FileFormat {
 const BRUKER_EXTENSIONS: [&str; 5] = [".d", ".tdf", ".tdf_bin", "ms2", "raw"];
 
 fn is_bruker(path: &str) -> bool {
-    BRUKER_EXTENSIONS.iter().any(|ext| {
-        if path.ends_with(std::path::MAIN_SEPARATOR) {
-            path.strip_suffix(std::path::MAIN_SEPARATOR)
-                .unwrap()
-                .ends_with(ext)
-        } else {
-            path.ends_with(ext)
-        }
-    })
+    // a directory may end in `/` (URLs, Unix) or the platform separator (Windows)
+    let path = path.trim_end_matches(['/', std::path::MAIN_SEPARATOR]);
+    BRUKER_EXTENSIONS.iter().any(|ext| path.ends_with(ext))
 }
 
 pub fn read_spectra(

@@ -1,0 +1,240 @@
+name: release
+
+# Builds, tests and packages Sage on native runners for all five platforms, in two
+# variants each: default features, and `--features mzpeak` (mzPeak input through the
+# HUPO-PSI reference reader). On a `v*` tag the archives are attached to the release.
+#
+# Signing follows the team's other repositories (FASTag, DIALibGen) and is OPTIONAL:
+# - macOS: with the seven MACOS_* secrets the binaries are signed with the Developer
+#   ID (hardened runtime) and notarized. A .tar.gz cannot carry a stapled ticket, so
+#   Gatekeeper checks online on first run. Without the secrets: unsigned + warning.
+# - Windows: SignPath, gated on SIGNPATH_API_TOKEN and SIGNPATH_PROJECT_SLUG. No
+#   SignPath project exists for Sage yet, so Windows ships unsigned + warning.
+# `secrets.*` is illegal in `if:`; gates map a secret into env and write an output.
+
+on:
+  push:
+    branches: [sage-improvements]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}${{ github.event_name == 'workflow_dispatch' && format('-dispatch-{0}', github.run_id) || '' }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+env:
+  CARGO_TERM_COLOR: always
+  # SignPath project slug; empty until a Sage project exists in SignPath
+  SIGNPATH_PROJECT_SLUG: ''
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # 22.04: glibc 2.35, so the binaries run on older distributions too
+          - { name: linux-x64,   runner: ubuntu-22.04,     target: x86_64-unknown-linux-gnu }
+          - { name: linux-arm64, runner: ubuntu-22.04-arm, target: aarch64-unknown-linux-gnu }
+          - { name: macos-arm64, runner: macos-14,         target: aarch64-apple-darwin }
+          - { name: macos-x64,   runner: macos-15-intel,   target: x86_64-apple-darwin }
+          - { name: windows-x64, runner: windows-2022,     target: x86_64-pc-windows-msvc }
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.name }}
+
+      - name: Version
+        id: version
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then v="${GITHUB_REF_NAME}"; else v="${GITHUB_SHA::8}"; fi
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+
+      - name: Test (default features)
+        run: cargo test --release --locked
+
+      - name: Test (mzPeak input)
+        run: cargo test --release --locked -p sage-cloudpath --features mzpeak
+
+      - name: Build both variants
+        run: |
+          exe=sage; [ "$RUNNER_OS" = Windows ] && exe=sage.exe
+          mkdir -p dist/default dist/mzpeak
+          cargo build --release --locked -p sage-cli
+          cp "target/release/$exe" dist/default/
+          cargo build --release --locked -p sage-cli --features mzpeak
+          cp "target/release/$exe" dist/mzpeak/
+          echo "EXE=$exe" >> "$GITHUB_ENV"
+
+      # Both binaries search the bundled test spectrum; the mzPeak binary also reads
+      # the same spectrum converted to mzPeak and must find the same PSM.
+      - name: Smoke test
+        run: |
+          set -euo pipefail
+          PY=$(command -v python3 || command -v python)
+          "$PY" - <<'PY'
+          import json
+          c = json.load(open("tests/config.json"))
+          c["mzml_paths"] = ["tests/LQSRPAAPPAPGPGQLTLR.mzpeak"]
+          json.dump(c, open("smoke-mzpeak.json", "w"))
+          PY
+          ./dist/default/$EXE tests/config.json -o smoke-default > /dev/null
+          ./dist/mzpeak/$EXE tests/config.json -o smoke-mzml > /dev/null
+          ./dist/mzpeak/$EXE smoke-mzpeak.json -o smoke-mzpeak > /dev/null
+          "$PY" - <<'PY'
+          import csv
+          def psms(d):
+              rows = list(csv.DictReader(open(f"{d}/results.sage.tsv"), delimiter="\t"))
+              return [(r["peptide"], r["scannr"], r["hyperscore"]) for r in rows]
+          a, b, c = psms("smoke-default"), psms("smoke-mzml"), psms("smoke-mzpeak")
+          assert a and a == b == c, (a, b, c)
+          print("smoke OK:", a[0])
+          PY
+
+      # ---------------------------------------------------------------- macOS signing
+      - name: Detect macOS signing readiness
+        if: runner.os == 'macOS' && startsWith(github.ref, 'refs/tags/v')
+        id: mac-signing
+        env:
+          MACOS_CERTIFICATE_BASE64: ${{ secrets.MACOS_CERTIFICATE_BASE64 }}
+        run: |
+          if [ -z "$MACOS_CERTIFICATE_BASE64" ]; then
+            echo "::warning title=Unsigned macOS binary::MACOS_CERTIFICATE_BASE64 is not set -- shipping unsigned. Gatekeeper will warn on first run."
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Import Developer ID certificate (macOS)
+        if: steps.mac-signing.outputs.enabled == 'true'
+        env:
+          MACOS_CERTIFICATE_BASE64: ${{ secrets.MACOS_CERTIFICATE_BASE64 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          MACOS_KEYCHAIN_PASSWORD: ${{ secrets.MACOS_KEYCHAIN_PASSWORD }}
+        run: |
+          KEYCHAIN_PATH="${RUNNER_TEMP}/sage-signing.keychain-db"
+          CERT_PATH="${RUNNER_TEMP}/cert.p12"
+          echo "$MACOS_CERTIFICATE_BASE64" | base64 --decode > "$CERT_PATH"
+          security create-keychain -p "$MACOS_KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$MACOS_KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security import "$CERT_PATH" -P "$MACOS_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$MACOS_KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security list-keychain -d user -s "$KEYCHAIN_PATH" $(security list-keychains -d user | tr -d '"' | xargs)
+          security default-keychain -d user -s "$KEYCHAIN_PATH"
+          rm -f "$CERT_PATH"
+
+      - name: Codesign + notarize (macOS)
+        if: steps.mac-signing.outputs.enabled == 'true'
+        timeout-minutes: 60
+        env:
+          MACOS_SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
+          MACOS_APPLE_ID: ${{ secrets.MACOS_APPLE_ID }}
+          MACOS_TEAM_ID: ${{ secrets.MACOS_TEAM_ID }}
+          MACOS_NOTARY_PASSWORD: ${{ secrets.MACOS_NOTARY_PASSWORD }}
+        run: |
+          for b in dist/default/sage dist/mzpeak/sage; do
+            codesign --force --options runtime --sign "$MACOS_SIGNING_IDENTITY" --timestamp "$b"
+            codesign --verify --strict --verbose=2 "$b"
+          done
+          ditto -c -k --keepParent dist "${RUNNER_TEMP}/sage-notarize.zip"
+          xcrun notarytool submit "${RUNNER_TEMP}/sage-notarize.zip" \
+            --apple-id "$MACOS_APPLE_ID" --team-id "$MACOS_TEAM_ID" \
+            --password "$MACOS_NOTARY_PASSWORD" --wait
+
+      # ------------------------------------------------------------ Windows signing
+      - name: Detect SignPath readiness (Windows)
+        if: runner.os == 'Windows' && startsWith(github.ref, 'refs/tags/v')
+        id: signpath-gate
+        env:
+          SIGNPATH_API_TOKEN: ${{ secrets.SIGNPATH_API_TOKEN }}
+        run: |
+          if [ -z "$SIGNPATH_API_TOKEN" ] || [ -z "$SIGNPATH_PROJECT_SLUG" ]; then
+            echo "::warning title=Unsigned Windows binary::SignPath is not configured for Sage -- shipping unsigned. SmartScreen will warn on first run."
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload unsigned binaries for SignPath (Windows)
+        if: steps.signpath-gate.outputs.enabled == 'true'
+        id: unsigned
+        uses: actions/upload-artifact@v4
+        with:
+          name: unsigned-windows
+          path: dist/
+
+      # SignPath receives a zip (upload-artifact always zips): its artifact
+      # configuration must be <zip-file><pe-file path="*.exe">…
+      - name: Sign via SignPath (Windows)
+        if: steps.signpath-gate.outputs.enabled == 'true'
+        uses: signpath/github-action-submit-signing-request@v1
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ secrets.SIGNPATH_ORG_ID }}
+          project-slug: ${{ env.SIGNPATH_PROJECT_SLUG }}
+          signing-policy-slug: release-signing
+          artifact-configuration-slug: initial
+          github-artifact-id: ${{ steps.unsigned.outputs.artifact-id }}
+          wait-for-completion: true
+          output-artifact-directory: dist
+
+      # ------------------------------------------------------------------- package
+      - name: Package
+        run: |
+          set -euo pipefail
+          v="${{ steps.version.outputs.version }}"
+          mkdir -p out
+          for variant in default mzpeak; do
+            n="sage-${v}-${{ matrix.target }}"
+            [ "$variant" = mzpeak ] && n="sage-${v}-mzpeak-${{ matrix.target }}"
+            mkdir -p "pkg/$n"
+            cp "dist/$variant/$EXE" README.md LICENSE "pkg/$n/"
+            [ "$variant" = mzpeak ] && cp packaging/NOTICE-mzpeak.txt "pkg/$n/"
+            if [ "$RUNNER_OS" = Windows ]; then
+              (cd pkg && 7z a -tzip "../out/$n.zip" "$n" > /dev/null)
+            else
+              tar -C pkg -czf "out/$n.tar.gz" "$n"
+            fi
+          done
+          ls -la out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sage-${{ matrix.name }}
+          path: out/*
+
+  release:
+    name: attach to release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: sage-*
+          path: out
+          merge-multiple: true
+      - name: Create or update the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          ls -la out
+          gh release view "$TAG" -R "$GITHUB_REPOSITORY" > /dev/null 2>&1 \
+            || gh release create "$TAG" -R "$GITHUB_REPOSITORY" --title "Sage $TAG" --notes "See CHANGELOG.md."
+          gh release upload "$TAG" -R "$GITHUB_REPOSITORY" --clobber out/*
