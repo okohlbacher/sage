@@ -411,53 +411,60 @@ impl Parameters {
         chunk_size: usize,
         max_bins: usize,
     ) -> Vec<Theoretical> {
-        // pass 1: fragment count and m/z key range of every chunk of peptides
-        let stats: Vec<(usize, u32, u32)> = peptides
-            .par_chunks(chunk_size)
-            .map(|chunk| {
-                let (mut n, mut lo, mut hi) = (0usize, u32::MAX, 0u32);
-                for peptide in chunk {
-                    for ion in self.index_ions(peptide) {
-                        let k = mz_key(ion.monoisotopic_mass);
-                        n += 1;
-                        lo = lo.min(k);
-                        hi = hi.max(k);
-                    }
-                }
-                (n, lo, hi)
-            })
-            .collect();
-        let total: usize = stats.iter().map(|s| s.0).sum();
-        if total == 0 {
+        if peptides.is_empty() {
             return Vec::new();
         }
-        let lo = stats.iter().map(|s| s.1).min().unwrap_or(0);
-        let hi = stats.iter().map(|s| s.2).max().unwrap_or(0);
+        // Bins over the m/z keys of [GUESS_LOW, heaviest peptide + GUESS_MARGIN]: the
+        // fragments of a peptide are lighter than the peptide plus the terminal group of an
+        // a/c/x/z ion, so practically every fragment falls into a regular bin without a
+        // separate pass for the fragments' range. Anything outside it (e.g. negative
+        // modification masses) goes to an overflow bin at either end, which is sorted
+        // by comparison.
+        let max_mass = peptides
+            .par_iter()
+            .map(|p| p.monoisotopic)
+            .reduce(|| f32::NEG_INFINITY, f32::max);
+        let lo = mz_key(GUESS_LOW);
+        let hi = mz_key((max_mass + GUESS_MARGIN).max(GUESS_LOW));
         let mut shift = 0;
         while ((hi >> shift) - (lo >> shift)) as usize >= max_bins.max(2) {
             shift += 1;
         }
         let base = lo >> shift;
-        let nbins = ((hi >> shift) - base) as usize + 1;
-        let bin = |mz: f32| ((mz_key(mz) >> shift) - base) as usize;
+        let nbins = ((hi >> shift) - base) as usize + 3;
+        let bin = |mz: f32| {
+            let k = mz_key(mz);
+            if k < lo {
+                0
+            } else if k > hi {
+                nbins - 1
+            } else {
+                ((k >> shift) - base) as usize + 1
+            }
+        };
 
-        // groups of consecutive chunks with about the same number of fragments
+        // groups of consecutive peptides with about the same number of residues (a proxy
+        // for their fragment count)
+        let weights: Vec<usize> = peptides
+            .par_chunks(chunk_size)
+            .map(|chunk| chunk.iter().map(|p| p.sequence.len()).sum())
+            .collect();
         let ngroups = (rayon::current_num_threads() * 4)
             .clamp(1, 256)
-            .min(stats.len());
-        let per_group = total.div_ceil(ngroups);
+            .min(weights.len());
+        let per_group = weights.iter().sum::<usize>().div_ceil(ngroups).max(1);
         let mut groups: Vec<std::ops::Range<usize>> = Vec::with_capacity(ngroups);
         let (mut start, mut acc) = (0, 0);
-        for (ix, s) in stats.iter().enumerate() {
-            acc += s.0;
-            if acc >= per_group || ix + 1 == stats.len() {
+        for (ix, w) in weights.iter().enumerate() {
+            acc += w;
+            if acc >= per_group || ix + 1 == weights.len() {
                 groups.push(start * chunk_size..((ix + 1) * chunk_size).min(peptides.len()));
                 start = ix + 1;
                 acc = 0;
             }
         }
 
-        // pass 2: per-group histograms over the bins
+        // pass 1: per-group histograms over the bins
         let hist: Vec<Vec<usize>> = groups
             .par_iter()
             .map(|range| {
@@ -470,6 +477,10 @@ impl Parameters {
                 h
             })
             .collect();
+        let total: usize = hist.iter().flatten().sum();
+        if total == 0 {
+            return Vec::new();
+        }
         // bin-major, then group order: within a bin, fragments stay in peptide order.
         // `slots[g][b]` = (next write position, end) of group g's range in bin b.
         let mut bounds = Vec::with_capacity(nbins + 1);
@@ -486,7 +497,7 @@ impl Parameters {
         drop(hist);
         assert_eq!(pos, total, "fragment count changed between passes");
 
-        // pass 3: write every fragment into its bin
+        // pass 2: write every fragment into its bin
         let mut fragments: Vec<Theoretical> = Vec::with_capacity(total);
         advise_huge_pages(fragments.spare_capacity_mut());
         struct Out(*mut Theoretical);
@@ -523,8 +534,8 @@ impl Parameters {
         // ranges tile `0..total`, so all `total` elements are initialised
         unsafe { fragments.set_len(total) };
 
-        // pass 4: order each bin by the key bits below `shift` (stable: equal m/z keep
-        // peptide order)
+        // pass 3: order each bin by the key bits below `shift` (stable: equal m/z keep
+        // peptide order); the overflow bins by comparison
         let mut bins = Vec::with_capacity(nbins);
         let mut rest = &mut fragments[..];
         for b in 0..nbins {
@@ -533,16 +544,18 @@ impl Parameters {
             rest = tail;
         }
         let low_mask = if shift == 0 { 0 } else { (1u32 << shift) - 1 };
-        bins.into_par_iter().for_each(|slice| {
-            if slice.len() < 2 || shift == 0 {
+        bins.into_par_iter().enumerate().for_each(|(b, slice)| {
+            if slice.len() < 2 {
                 return;
             }
-            if shift <= 16 {
-                let mut count = vec![0usize; 1 << shift];
+            if b == 0 || b == nbins - 1 || shift > 16 {
+                slice.sort_by_key(|f| mz_key(f.fragment_mz));
+            } else if shift > 0 {
+                let mut count = vec![0u32; 1 << shift];
                 for f in slice.iter() {
                     count[(mz_key(f.fragment_mz) & low_mask) as usize] += 1;
                 }
-                let mut sum = 0;
+                let mut sum = 0u32;
                 for c in count.iter_mut() {
                     let n = *c;
                     *c = sum;
@@ -551,11 +564,9 @@ impl Parameters {
                 let scratch = slice.to_vec();
                 for f in scratch {
                     let k = (mz_key(f.fragment_mz) & low_mask) as usize;
-                    slice[count[k]] = f;
+                    slice[count[k] as usize] = f;
                     count[k] += 1;
                 }
-            } else {
-                slice.sort_by_key(|f| mz_key(f.fragment_mz));
             }
         });
         fragments
@@ -676,6 +687,10 @@ fn advise_huge_pages<T>(buf: &mut [T]) {
 
 /// Upper bound on the number of m/z bins of [`Parameters::sorted_fragments`]
 const MAX_BINS: usize = 8192;
+/// Fragment masses expected in `GUESS_LOW..=heaviest peptide + GUESS_MARGIN` (Da);
+/// others are sorted in two overflow bins
+const GUESS_LOW: f32 = 50.0;
+const GUESS_MARGIN: f32 = 200.0;
 
 /// Stable LSD radix sort of `page` by peptide index (indices below `2^bits`), in at
 /// most 12-bit digits. A page holds `bucket_size` fragments in m/z order with random
@@ -1225,6 +1240,23 @@ mod test {
             }
         }
         assert!(params.sorted_fragments(&[]).is_empty());
+
+        // fragments outside the guessed range (a1 ions below GUESS_LOW; masses above a
+        // peptide mass that is too low) are sorted in the overflow bins
+        let mut wide = params.clone();
+        wide.ion_kinds = vec![Kind::A, Kind::B, Kind::Y];
+        wide.min_ion_index = 0;
+        let mut expected = wide.fragments(&peptides);
+        expected.sort_by(|a, b| a.fragment_mz.total_cmp(&b.fragment_mz));
+        assert!(expected[0].fragment_mz < GUESS_LOW);
+        for max_bins in [2, 64, MAX_BINS] {
+            assert_eq!(wide.sorted_fragments_with(&peptides, 7, max_bins), expected);
+        }
+        let mut light = peptides.clone();
+        light.iter_mut().for_each(|p| p.monoisotopic = 100.0);
+        let mut expected = params.fragments(&light);
+        expected.sort_by(|a, b| a.fragment_mz.total_cmp(&b.fragment_mz));
+        assert_eq!(params.sorted_fragments_with(&light, 7, MAX_BINS), expected);
 
         // pages: radix sort by peptide index = stable sort
         let mut scratch = Vec::new();
