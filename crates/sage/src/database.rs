@@ -606,13 +606,14 @@ impl Parameters {
         // and within Bucket 1, we can perform another binary search to find fragments
         // matching our desired precursor m/z tolerance
 
+        let peptide_bits = u32::BITS - (target_decoys.len().max(1) as u32 - 1).leading_zeros();
         let min_value = fragments
             .par_chunks_mut(self.bucket_size)
-            .map(|chunk| {
+            .map_init(Vec::new, |scratch, chunk| {
                 // There should always be at least one item in the chunk!
                 //  we know the chunk is already sorted by fragment_mz too, so this is minimum value
                 let min = chunk[0].fragment_mz;
-                chunk.sort_unstable_by_key(|frag| frag.peptide_index);
+                sort_by_peptide(chunk, scratch, peptide_bits);
                 min
             })
             .collect::<Vec<_>>();
@@ -675,6 +676,49 @@ fn advise_huge_pages<T>(buf: &mut [T]) {
 
 /// Upper bound on the number of m/z bins of [`Parameters::sorted_fragments`]
 const MAX_BINS: usize = 8192;
+
+/// Stable LSD radix sort of `page` by peptide index (indices below `2^bits`), in at
+/// most 12-bit digits. A page holds `bucket_size` fragments in m/z order with random
+/// peptide indices; a comparison sort of each page cost ~20 ns per fragment.
+fn sort_by_peptide(page: &mut [Theoretical], scratch: &mut Vec<Theoretical>, bits: u32) {
+    if page.len() < 2 || bits == 0 {
+        return;
+    }
+    if page.len() <= 64 {
+        page.sort_by_key(|frag| frag.peptide_index);
+        return;
+    }
+    let passes = bits.div_ceil(12);
+    let width = bits.div_ceil(passes);
+    let mask = (1u32 << width) - 1;
+    let mut count = vec![0usize; 1 << width];
+    scratch.clear();
+    scratch.extend_from_slice(page);
+    let (mut src, mut dst): (&mut [Theoretical], &mut [Theoretical]) = (&mut scratch[..], page);
+    for pass in 0..passes {
+        let shift = pass * width;
+        count.iter_mut().for_each(|c| *c = 0);
+        for frag in src.iter() {
+            count[((frag.peptide_index.0 >> shift) & mask) as usize] += 1;
+        }
+        let mut sum = 0;
+        for c in count.iter_mut() {
+            let n = *c;
+            *c = sum;
+            sum += n;
+        }
+        for frag in src.iter() {
+            let d = ((frag.peptide_index.0 >> shift) & mask) as usize;
+            dst[count[d]] = *frag;
+            count[d] += 1;
+        }
+        std::mem::swap(&mut src, &mut dst);
+    }
+    // after an even number of passes the result is in `scratch`
+    if passes % 2 == 0 {
+        dst.copy_from_slice(src);
+    }
+}
 
 /// Unsigned key whose order is that of [`f32::total_cmp`]
 #[inline(always)]
@@ -1181,6 +1225,26 @@ mod test {
             }
         }
         assert!(params.sorted_fragments(&[]).is_empty());
+
+        // pages: radix sort by peptide index = stable sort
+        let mut scratch = Vec::new();
+        for bits in [1, 5, 12, 13, 24, 25, 32] {
+            for len in [2, 3, 64, 65, 1000, 8192] {
+                let mut page: Vec<Theoretical> = (0..len)
+                    .map(|i| Theoretical {
+                        peptide_index: PeptideIx(
+                            ((i as u64 * 2654435761) % (1u64 << bits)) as u32
+                                & (u32::MAX >> (32 - bits)),
+                        ),
+                        fragment_mz: i as f32,
+                    })
+                    .collect();
+                let mut expected = page.clone();
+                expected.sort_by_key(|f| f.peptide_index);
+                sort_by_peptide(&mut page, &mut scratch, bits);
+                assert_eq!(page, expected, "bits {bits} len {len}");
+            }
+        }
 
         // keys order like `total_cmp`, including signed zeros, infinities and NaN
         let values = [
