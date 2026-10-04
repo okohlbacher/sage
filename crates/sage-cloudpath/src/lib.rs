@@ -92,7 +92,19 @@ const LOCAL_READ_SIZE: usize = 2 << 20;
 async fn read_url(url: &Url) -> Result<Box<dyn AsyncBufRead + Unpin + Send>, Error> {
     let reader: BufReader<Box<dyn AsyncRead + Unpin + Send>> = if url.scheme() == "file" {
         let path = url.to_file_path().map_err(|_| Error::InvalidUri)?;
-        let file = tokio::fs::File::open(path).await?;
+        // name the file, as object_store's local store did ("Unable to open file ...")
+        let named = |e: std::io::Error| {
+            std::io::Error::new(
+                e.kind(),
+                format!("Unable to open file {}: {}", path.display(), e),
+            )
+        };
+        let file = tokio::fs::File::open(&path).await.map_err(named)?;
+        // a directory opens, and only its first read fails
+        if file.metadata().await.map_err(named)?.is_dir() {
+            let e = std::io::Error::new(std::io::ErrorKind::IsADirectory, "is a directory");
+            return Err(named(e).into());
+        }
         BufReader::with_capacity(LOCAL_READ_SIZE, Box::new(file))
     } else {
         let (store, obj_path) = parse_url(url)?;
@@ -213,6 +225,20 @@ mod test {
     fn filename_azure() {
         let url = Url::parse("az://my-container/path/to/file.mzML").unwrap();
         assert_eq!(filename(&url).as_deref(), Some("file.mzML"));
+    }
+
+    #[test]
+    fn a_local_file_that_cannot_be_read_is_named() {
+        // a directory where a file is expected
+        let dir = std::env::temp_dir().join(format!("sage-open-error-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let err = read_and_execute(dir.to_str().unwrap(), |_| async move { Ok(()) })
+            .expect_err("a directory is not a readable file");
+        std::fs::remove_dir(&dir).unwrap();
+        let message = err.to_string();
+        assert!(message.starts_with("Unable to open file "), "{message}");
+        let name = dir.file_name().unwrap().to_str().unwrap();
+        assert!(message.contains(name), "{message}");
     }
 
     #[test]
