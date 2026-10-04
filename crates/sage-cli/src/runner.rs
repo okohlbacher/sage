@@ -657,6 +657,7 @@ impl Runner {
                 &outputs.quant,
                 &filenames,
                 &self.database,
+                self.parameters.ion_model,
             )?;
 
             let path = self.make_path("results.sage.parquet");

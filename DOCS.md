@@ -234,6 +234,8 @@ For additional information about configuration options and output file formats, 
   "min_matched_peaks": 6,   // Optional[int] {default=4}: minimum # of matched b+y ions to use for reporting PSMs
   "max_fragment_charge": 1, // Optional[int] {default=null}: maximum fragment ion charge states to consider,
   "report_psms": 1,         // Optional[int] {default=1}: number of PSMs to report for each spectra. Higher values might disrupt PSM rescoring.
+  "ion_model": false,       // Optional[bool] {default=false}: self-trained, cross-fitted fragment-ion model; adds the
+                            // `ion_llr` and `ion_explained` columns to the results and the PIN file (for Percolator/mokapot)
   "output_directory": "s3://bucket/prefix" // Optional[str] {default=`.`}: Place output files in a given directory or S3 bucket/prefix
   "mzml_paths": [           // List[str]: representing paths to mzML (or gzipped-mzML) files for search
     "local/path.mzML",
@@ -436,6 +438,7 @@ Note on the settings below:
 - **min_matched_peaks**: Integer. The minimum number of matched b+y ions to use for reporting PSMs (default: 4).
 - **max_fragment_charge**: Integer. The maximum fragment ion charge states to consider (default: null - use precursor z-1).
 - **report_psms**: Integer. The number of PSMs to report for each spectrum. Higher values might disrupt LDA (default: 1).
+- **ion_model**: Boolean. Learn a fragment-ion likelihood model from each file's own confident PSMs and report two extra features per PSM, `ion_llr` and `ion_explained`, in results.sage.tsv (or results.sage.parquet) and in the PIN file (default: false). They are meant for a rescorer such as Percolator or mokapot; Sage's own LDA does not use them. See [Fragment-ion model](#fragment-ion-model-ion_model).
 - **parallel**: Boolean. Parse and search files in parallel. For large numbers of files or low RAM, setting this to false can reduce memory usage at the cost of running slower (default: true).
 
 ## mzML Paths
@@ -499,5 +502,19 @@ The "results.sage.tsv" file contains the following columns (headers):
 - `protein_q`: Assigned protein-level q-value.
 - `ms1_intensity`: Intensity of the selected MS1 precursor ion (not label-free quant)
 - `ms2_intensity`: Total intensity of MS2 spectrum
+- `ion_llr`, `ion_explained`: Fragment-ion model features, only with `ion_model: true` (see below). They are also written to the PIN file, before `Peptide`.
 
 These columns provide comprehensive information about each candidate peptide spectrum match (PSM) identified by the Sage search engine.
+
+## Fragment-ion model (`ion_model`)
+
+With `"ion_model": true`, Sage learns, for every input file, how the fragment ions of confidently identified peptides show up in that file's spectra, and scores every PSM against it:
+
+- **Evidence**: all deisotoped peaks of the MS2 spectrum (not only the `max_peaks` most intense ones), with their intensity rank.
+- **Contexts and outcomes**: each theoretical b/y ion (fragment charge 1, and also 2 for precursor charge >= 3) has a context (ion series, precursor charge 2 / 3 / >= 4, fragment charge, position along the peptide in tenths, cleavage N-terminal to proline or C-terminal to D/E, complementary ion found or not) and an outcome (not found, or found at one of 7 intensity rank bins (1-2, 3-5, 6-10, 11-20, 21-40, 41-80, > 80) x 3 mass error bins (< 1/4, < 1/2, <= 1 of the fragment tolerance); the nearest peak counts).
+- **Training**: rank-1 target PSMs at 1% FDR of a label-free target-decoy competition on the HyperScore computed with intensities normalised to the spectrum's most intense peak, separately for precursor charge <= 2 and >= 3. A *signal* table counts the outcomes of the identified peptides, a *noise* table those of the same peptides reversed except for the C-terminal residue, matched against the same spectra. Both are smoothed by back-off over coarser contexts (pseudo-count 20).
+- **Features**: `ion_llr` = sum over the ions of log P(outcome | signal) - log P(outcome | noise); `ion_explained` = share of the ions the signal model expects to be found that were found (weighted by that probability).
+- **Cross-fitting**: the spectra of a file are split into two folds by the parity of their index (among the spectra with PSMs, in file order). Each fold trains a model, and every PSM is scored by the model of the other fold, so no PSM is scored by a model trained on it. If a fold has fewer than 100 training PSMs, or the file has no decoy PSMs, the file's features are 0 (a warning is logged).
+- **Cost**: the peak lists take about 5 bytes per deisotoped peak while a batch of files is searched; training and scoring take well under a second per file.
+
+On the 20 public files of OpenMS issue #10364 (Percolator 3.09, 20 seeds, `max_peaks` 150), the two columns raise PSMs at 1% FDR by 5.2% on average (Astral +24%, Velos +5.1%, HF-X +4.6%, TMT +3.4-3.6%, Lumos LFQ and timsTOF +0.2-0.3%); the doubled-database entrapment FDP stays at 1.08-1.09% (pooled over three shuffles). All other columns are the same with and without the option, and the output does not depend on the number of threads.

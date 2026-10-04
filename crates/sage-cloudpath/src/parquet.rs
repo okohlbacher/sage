@@ -25,7 +25,8 @@ use sage_core::lfq::{Peak, PrecursorId};
 use sage_core::scoring::Feature;
 use sage_core::tmt::TmtQuant;
 
-pub fn build_schema() -> Result<Type, parquet::errors::ParquetError> {
+/// Schema of results.sage.parquet; `ion_model` adds the `ion_llr` and `ion_explained` columns
+pub fn build_schema(ion_model: bool) -> Result<Type, parquet::errors::ParquetError> {
     let msg = r#"
         message schema {
             required int64 psm_id;
@@ -72,6 +73,7 @@ pub fn build_schema() -> Result<Type, parquet::errors::ParquetError> {
             required float peptide_q;
             required float protein_q;
             required float protein_group_q;
+            @ION_MODEL@
             optional group reporter_ion_intensity (LIST) {
                 repeated group list {
                     optional float element;
@@ -79,7 +81,11 @@ pub fn build_schema() -> Result<Type, parquet::errors::ParquetError> {
             }
         }
     "#;
-    parquet::schema::parser::parse_message_type(msg)
+    let ion_columns = match ion_model {
+        true => "required float ion_llr;\n            required float ion_explained;",
+        false => "",
+    };
+    parquet::schema::parser::parse_message_type(&msg.replace("@ION_MODEL@", ion_columns))
 }
 
 /// Caller must guarantee that `reporter_ions` is not an empty slice
@@ -132,8 +138,9 @@ pub fn serialize_features(
     reporter_ions: &[TmtQuant],
     filenames: &[String],
     database: &IndexedDatabase,
+    ion_model: bool,
 ) -> Result<Vec<u8>, parquet::errors::ParquetError> {
-    let schema = build_schema()?;
+    let schema = build_schema(ion_model)?;
 
     let options = WriterProperties::builder()
         .set_compression(parquet::basic::Compression::ZSTD(ZstdLevel::try_new(3)?))
@@ -238,6 +245,10 @@ pub fn serialize_features(
         write_col!(peptide_q, FloatType);
         write_col!(protein_q, FloatType);
         write_col!(protein_group_q, FloatType);
+        if ion_model {
+            write_col!(ion_llr, FloatType);
+            write_col!(ion_explained, FloatType);
+        }
 
         if let Some(col) = rg.next_column()? {
             if reporter_ions.is_empty() {
