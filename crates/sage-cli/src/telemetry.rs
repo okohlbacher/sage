@@ -44,9 +44,9 @@ impl Telemetry {
         parquet: bool,
         runtime_secs: u64,
     ) -> Telemetry {
-        let mut system = System::default();
-        system.refresh_all();
-
+        // The system details are filled in by `send`: querying them here (it was a full
+        // `sysinfo` refresh of every process, disk, network and sensor) took 0.1-0.2 s at
+        // the end of every run, also with telemetry disabled.
         Telemetry {
             version: settings.version,
             peptides,
@@ -56,13 +56,19 @@ impl Telemetry {
             lfq: settings.quant.lfq,
             tmt: settings.quant.tmt,
             parquet,
-            os_name: system.long_os_version().unwrap_or_default(),
-            total_memory: system.total_memory(),
+            os_name: String::new(),
+            total_memory: 0,
             cpus: num_cpus::get(),
         }
     }
 
-    pub fn send(self) {
+    pub fn send(mut self) {
+        // only memory needs a refresh; the OS version is read directly
+        let mut system = System::new();
+        system.refresh_memory();
+        self.os_name = system.long_os_version().unwrap_or_default();
+        self.total_memory = system.total_memory();
+
         log::trace!("sending telemetry...");
         // doesn't matter if it fails
         match sage_cloudpath::util::send_data(
