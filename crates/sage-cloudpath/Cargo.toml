@@ -21,6 +21,8 @@ object_store = { version = "0.13", features = ["aws", "gcp", "azure"] }
 tokio = { version = "1.0", features = ["fs", "io-util", "rt", "macros"] }
 tokio-util = { version = "0.7", features = ["io"] }
 quick-xml = { version = "0.31.0", features = ["async-tokio"] }
+# already a quick-xml dependency: finds the spectrum boundaries for the parallel mzML parse
+memchr = "2"
 timsrust = { version = "0.4.2"}
 # already a timsrust dependency: reads the PASEF table for the frame-once DDA reader
 rusqlite = { version = "0.32", features = ["bundled"] }

@@ -147,7 +147,10 @@ pub fn read_mzml_levels(
 
 /// [`read_spectra`], then `f` applied to every spectrum. For Bruker .d files `f` runs
 /// while the file is read, so only a block of unprocessed spectra is alive at a time
-/// instead of the whole file's (~1.5 GB for a 60 min ddaPASEF run).
+/// instead of the whole file's (~1.5 GB for a 60 min ddaPASEF run). Local, uncompressed
+/// mzML files are parsed in parallel chunks, each processed right away
+/// ([`crate::mzml_parallel`]; same spectra); gzipped and remote files, and files that
+/// module does not cut, are parsed serially. `SAGE_MZML_SERIAL=1` forces the serial parse.
 pub fn read_processed<T: Send>(
     url: &Url,
     file_id: usize,
@@ -159,6 +162,21 @@ pub fn read_processed<T: Send>(
     use rayon::prelude::*;
     match FileFormat::from(url.as_ref()) {
         FileFormat::TDF => read_tdf_with(url, file_id, bruker_processor, requires_ms1, f),
+        FileFormat::MzML if parallel_mzml(url) => {
+            let path = url.to_file_path().map_err(|_| Error::InvalidUri)?;
+            let sizes = crate::mzml_parallel::Sizes::default();
+            match crate::mzml_parallel::read_processed(&path, file_id, sn, !requires_ms1, sizes, &f)
+            {
+                Ok(spectra) => Ok(spectra),
+                Err(why) => {
+                    log::debug!("{}: serial mzML parse ({})", url, why);
+                    Ok(read_mzml_levels(url, file_id, sn, !requires_ms1)?
+                        .into_par_iter()
+                        .map(&f)
+                        .collect())
+                }
+            }
+        }
         _ => Ok(
             read_spectra(url, file_id, sn, bruker_processor, requires_ms1)?
                 .into_par_iter()
@@ -166,6 +184,13 @@ pub fn read_processed<T: Send>(
                 .collect(),
         ),
     }
+}
+
+/// Local, uncompressed mzML (positioned reads need a local file; gzip is not seekable), unless
+/// `SAGE_MZML_SERIAL` is set (to anything but `0`)
+fn parallel_mzml(url: &Url) -> bool {
+    let off = std::env::var_os("SAGE_MZML_SERIAL").is_some_and(|v| v != "0");
+    !off && url.scheme() == "file" && !crate::gzip_heuristic(url)
 }
 
 pub fn read_tdf(

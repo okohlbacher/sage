@@ -3748,6 +3748,7 @@ dependencies = [
  "flate2",
  "futures",
  "log",
+ "memchr",
  "mzdata",
  "mzpeak_prototyping",
  "object_store",
