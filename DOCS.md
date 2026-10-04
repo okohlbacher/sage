@@ -230,7 +230,8 @@ For additional information about configuration options and output file formats, 
   "wide_window": false,     // Optional[bool] {default=false}: _ignore_ `precursor_tol` and search in wide-window/DIA mode
   "predict_rt": false,    // Optional[bool] {default=true}: use retention time prediction model as an feature for LDA
   "min_peaks": 15,          // Optional[int] {default=15}: only process MS2 spectra with at least N peaks
-  "max_peaks": 150,         // Optional[int] {default=150}: take the top N most intense MS2 peaks to search,
+  "max_peaks": "auto",      // Optional[int | "auto"] {default="auto"}: take the top N most intense MS2 peaks to search;
+                            // "auto" = 80 for a Da `fragment_tol` reaching 0.1 Da (150 with TMT at MS2), else 400
   "min_matched_peaks": 6,   // Optional[int] {default=4}: minimum # of matched b+y ions to use for reporting PSMs
   "max_fragment_charge": 1, // Optional[int] {default=null}: maximum fragment ion charge states to consider,
   "report_psms": 1,         // Optional[int] {default=1}: number of PSMs to report for each spectra. Higher values might disrupt PSM rescoring.
@@ -434,7 +435,18 @@ Note on the settings below:
 - **wide_window**: Boolean. Ignore `precursor_tol` and search spectra in wide-window/dynamic precursor tolerance mode (default: false).
 - **predict_rt**: Boolean. Use retention time prediction model as a feature for LDA (default: true).
 - **min_peaks**: Integer. Only process MS2 spectra with at least N peaks (default: 15).
-- **max_peaks**: Integer. Take the top N most intense MS2 peaks to search (default: 150).
+- **max_peaks**: Integer or `"auto"`. Take the top N most intense MS2 peaks (after deisotoping) to search (default: `"auto"`).
+  `"auto"` keeps 80 peaks when `fragment_tol` is given in Da and reaches at least 0.1 Da on one side (low-resolution
+  fragment spectra, e.g. ion trap CID searched at 0.5 Da), and 400 peaks otherwise (a ppm or pct tolerance, or a narrow
+  Da tolerance such as 0.02 Da). With TMT quantification at MS2 (`quant.tmt_settings.level` 2) and a Da tolerance
+  reaching 0.1 Da, `"auto"` keeps 150 peaks, because the reporter ions are read from the capped spectrum and 80 peaks
+  drop some of them. High-resolution spectra carry real fragment ions well below the 150th most intense peak; at a
+  wide Da tolerance, low-intensity peaks mostly add chance matches. On the 20 public files of the OpenMS benchmark
+  (OpenMS#10364, Percolator, 1% FDR) `"auto"` finds 2.3% more PSMs than the former fixed default of 150
+  (Astral +10.8%), at a lower doubled-database entrapment FDP (1.08% -> 1.03%), and Sage's own q-values find 2.2% more.
+  Searches of high-resolution data take up to 9% longer (more peaks to score), 0.5 Da searches up to 10% less.
+  The resolved number is logged and written to `results.json`; an explicit number is used as given
+  (`max_peaks: 150` reproduces the results of earlier versions).
 - **min_matched_peaks**: Integer. The minimum number of matched b+y ions to use for reporting PSMs (default: 4).
 - **max_fragment_charge**: Integer. The maximum fragment ion charge states to consider (default: null - use precursor z-1).
 - **report_psms**: Integer. The number of PSMs to report for each spectrum. Higher values might disrupt LDA (default: 1).
