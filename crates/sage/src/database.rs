@@ -12,6 +12,7 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::hash::Hash;
 use std::sync::Arc;
+use std::sync::OnceLock;
 
 #[derive(Deserialize, Serialize, Clone, Debug)]
 pub struct EnzymeBuilder {
@@ -344,12 +345,21 @@ impl Parameters {
     /// All theoretical fragments of `peptides`, in [`binned_fragments`] order: by m/z
     /// ([`f32::total_cmp`]), fragments of equal m/z by peptide index.
     ///
-    /// With `indexed`, only the peptides marked `true` contribute fragments; every
-    /// fragment still carries the peptide's index into the complete `peptides`.
-    fn sorted_fragments(&self, peptides: &[Peptide], indexed: Option<&[bool]>) -> Vec<Theoretical> {
+    /// Once `indexed` holds flags (one per peptide), only the peptides marked `true`
+    /// contribute fragments; every fragment still carries the peptide's index into the
+    /// complete `peptides`. `late` is called once after the fragments were counted if
+    /// `indexed` is still empty then; if it fills `indexed` (and returns `true`), the
+    /// count is repeated for the marked peptides before the index is allocated.
+    fn sorted_fragments(
+        &self,
+        peptides: &[Peptide],
+        indexed: &OnceLock<Vec<bool>>,
+        late: &mut dyn FnMut() -> bool,
+    ) -> Vec<Theoretical> {
         self.sorted_fragments_with(
             peptides,
             indexed,
+            late,
             4096,
             MAX_BINS,
             (rayon::current_num_threads() * 4).clamp(1, 256),
@@ -359,15 +369,13 @@ impl Parameters {
     fn sorted_fragments_with(
         &self,
         peptides: &[Peptide],
-        indexed: Option<&[bool]>,
+        indexed: &OnceLock<Vec<bool>>,
+        late: &mut dyn FnMut() -> bool,
         chunk_size: usize,
         max_bins: usize,
         max_groups: usize,
     ) -> Vec<Theoretical> {
-        if let Some(indexed) = indexed {
-            assert_eq!(indexed.len(), peptides.len(), "one flag per peptide");
-        }
-        let is_indexed = |ix: usize| indexed.map_or(true, |indexed| indexed[ix]);
+        let is_indexed = |ix: usize| indexed.get().map_or(true, |indexed| indexed[ix]);
         // The fragments of a peptide are lighter than the peptide plus the terminal group
         // of an a/c/x/z ion, so practically every fragment falls into a regular bin of
         // [GUESS_LOW, heaviest peptide + GUESS_MARGIN] without a separate pass over all
@@ -399,11 +407,12 @@ impl Parameters {
             chunk_size,
             max_groups,
             SCRATCH_SHARE,
+            &mut || indexed.get().is_none() && late(),
         )
     }
 
     pub fn build_from_peptides(self, target_decoys: Vec<Peptide>) -> IndexedDatabase {
-        self.build_index(target_decoys, None)
+        self.build_index(target_decoys, &mut |_| None)
     }
 
     /// Like [`Self::build_from_peptides`], but only the fragments of the peptides marked
@@ -417,10 +426,53 @@ impl Parameters {
         target_decoys: Vec<Peptide>,
         reachable: &[bool],
     ) -> IndexedDatabase {
-        self.build_index(target_decoys, Some(reachable))
+        let mut reachable = Some(reachable.to_vec());
+        self.build_index(target_decoys, &mut |_| reachable.take())
     }
 
-    fn build_index(self, target_decoys: Vec<Peptide>, indexed: Option<&[bool]>) -> IndexedDatabase {
+    /// Like [`Self::build_reachable`], for when the reachable peptides become known only
+    /// while the index is being built (the spectra are still being read). `reachable` is
+    /// asked before the fragments are counted, after they were counted (before the index
+    /// is allocated and filled) and after they were sorted by m/z (before they are
+    /// bucketed), with a database that holds the complete peptide list and no fragments
+    /// yet. It returns `None` while it cannot tell, and the build goes on with every
+    /// peptide's fragments: the build never waits. Once it returns the flags, only the
+    /// fragments of the peptides marked are indexed from that step on (the count is
+    /// repeated for them, or the sorted fragments of the others are dropped, keeping the
+    /// order). Whichever step that happens at, the index is the one
+    /// [`Self::build_reachable`] gives (the order of the fragments is a total order, see
+    /// [`binned_fragments`]); if it never happens, it is the full index. The search gives
+    /// the same results in every case; only the time and memory of the build and the
+    /// search differ.
+    pub fn build_pruned_when_ready(
+        self,
+        target_decoys: Vec<Peptide>,
+        mut reachable: impl FnMut(&IndexedDatabase) -> Option<Vec<bool>>,
+    ) -> IndexedDatabase {
+        self.build_index(target_decoys, &mut reachable)
+    }
+
+    fn build_index(
+        self,
+        target_decoys: Vec<Peptide>,
+        reachable: &mut dyn FnMut(&IndexedDatabase) -> Option<Vec<bool>>,
+    ) -> IndexedDatabase {
+        // the peptide list alone, for `reachable`
+        let db = IndexedDatabase {
+            peptides: target_decoys,
+            ..Default::default()
+        };
+        let n = db.peptides.len();
+        // `reachable` is not asked again once it has answered
+        let indexed = OnceLock::new();
+        let mut ask = || {
+            let flags = reachable(&db)?;
+            assert_eq!(flags.len(), n, "one flag per peptide");
+            Some(flags)
+        };
+        if let Some(flags) = ask() {
+            let _ = indexed.set(flags);
+        }
         log::trace!("generating fragments");
 
         // Finally, perform in silico digest for our target sequences
@@ -428,7 +480,28 @@ impl Parameters {
         // [`SpectrumProcessor`] or during scoring - all theoretical
         // fragments are monoisotopic/uncharged
         // All of our theoretical fragments, sorted by m/z from low to high
-        let mut fragments = self.sorted_fragments(&target_decoys, indexed);
+        let mut fragments = self.sorted_fragments(&db.peptides, &indexed, &mut || {
+            let flags = ask();
+            if flags.is_some() {
+                log::info!(
+                    "counting the fragments of the reachable peptides only (counted all first)"
+                );
+            }
+            flags.map_or(false, |flags| indexed.set(flags).is_ok())
+        });
+        if indexed.get().is_none() {
+            if let Some(flags) = ask() {
+                // (keeps the m/z order)
+                let before = fragments.len();
+                retain_indexed(&mut fragments, &flags);
+                log::info!(
+                    "dropped {} of {} fragments (unreachable peptides) before bucketing",
+                    before - fragments.len(),
+                    before,
+                );
+            }
+        }
+        let target_decoys = db.peptides;
         log::trace!("finalizing index");
 
         // Now, we bucket all of our theoretical fragments, and within each bucket
@@ -504,6 +577,67 @@ impl Parameters {
             decoy_tag: self.decoy_tag,
         }
     }
+}
+
+/// Keep only the fragments of the peptides marked in `indexed`, in their order: each
+/// block is compacted in parallel, then the blocks are moved together in parallel too
+/// (one thread moving up to ~2.4 GB took a few hundred ms on the critical path).
+fn retain_indexed(fragments: &mut Vec<Theoretical>, indexed: &[bool]) {
+    const BLOCK: usize = 1 << 16;
+    let kept = fragments
+        .par_chunks_mut(BLOCK)
+        .map(|block| {
+            let mut n = 0;
+            for i in 0..block.len() {
+                if indexed[block[i].peptide_index.0 as usize] {
+                    block[n] = block[i];
+                    n += 1;
+                }
+            }
+            n
+        })
+        .collect::<Vec<_>>();
+    // block b's kept fragments, now at the start of the block, go to `to[b]..to[b + 1]`
+    let mut to = Vec::with_capacity(kept.len() + 1);
+    let mut len = 0;
+    for &n in &kept {
+        to.push(len);
+        len += n;
+    }
+    to.push(len);
+    // Every block moves left (`to[b] <= b * BLOCK`) and never onto the fragments of a later
+    // block (`to[b + 1] <= (b + 1) * BLOCK`). So with the blocks before `a` in place, block
+    // `a` can move, and at the same time every later block `b` whose destination ends
+    // before block `a` starts (`to[b + 1] <= a * BLOCK`): none of these moves reads what
+    // another one writes. With a share `r` of the fragments kept, each such wave reaches
+    // `1 / r` times further than the last one.
+    let mut a = 0;
+    while a < kept.len() {
+        let start = a * BLOCK;
+        if to[a] != start {
+            fragments.copy_within(start..start + kept[a], to[a]);
+        }
+        let mut c = a + 1;
+        while c < kept.len() && to[c + 1] <= start {
+            c += 1;
+        }
+        if c > a + 1 {
+            let (done, rest) = fragments.split_at_mut(start);
+            let rest = &*rest;
+            let mut free = &mut done[to[a + 1]..to[c]];
+            let mut moves = Vec::with_capacity(c - a - 1);
+            for b in a + 1..c {
+                let (head, tail) = std::mem::take(&mut free).split_at_mut(kept[b]);
+                moves.push((head, &rest[(b - a) * BLOCK..][..kept[b]]));
+                free = tail;
+            }
+            moves
+                .into_par_iter()
+                .for_each(|(out, block)| out.copy_from_slice(block));
+        }
+        a = c;
+    }
+    fragments.truncate(len);
 }
 
 /// Ask the kernel to back `buf` with transparent huge pages before it is touched.
@@ -672,6 +806,11 @@ impl ScratchPool {
 /// Memory: the final array (no second copy of the fragments), two positions per group
 /// and bin (freed before the bin sort), and the bin sort's buffers, at most
 /// 1/`scratch_share` of the final array (or one bin), all allocated by the calling thread.
+///
+/// `recount` is called once after the counting pass. If it returns `true`, `weight` and
+/// `ions` changed (an item may now yield fewer fragments), and the items are grouped and
+/// counted again before anything else is allocated.
+#[allow(clippy::too_many_arguments)]
 fn binned_fragments<W, F, I>(
     n: usize,
     weight: W,
@@ -680,6 +819,7 @@ fn binned_fragments<W, F, I>(
     chunk_size: usize,
     max_groups: usize,
     scratch_share: usize,
+    recount: &mut dyn FnMut() -> bool,
 ) -> Vec<Theoretical>
 where
     W: Fn(usize) -> usize + Sync,
@@ -694,20 +834,28 @@ where
         return Vec::new();
     }
     let nbins = bins.len;
-    let groups = balanced_groups(n, chunk_size, max_groups, weight);
 
     // pass 1: the number of fragments per group and bin (one row per group)
-    let mut table = vec![0usize; groups.len() * nbins];
-    table
-        .par_chunks_mut(nbins)
-        .zip(groups.par_iter())
-        .for_each(|(counts, range)| {
-            for ix in range.clone() {
-                for mz in ions(ix) {
-                    counts[bins.of(mz)] += 1;
+    let count = || {
+        let groups = balanced_groups(n, chunk_size, max_groups, &weight);
+        let mut table = vec![0usize; groups.len() * nbins];
+        table
+            .par_chunks_mut(nbins)
+            .zip(groups.par_iter())
+            .for_each(|(counts, range)| {
+                for ix in range.clone() {
+                    for mz in ions(ix) {
+                        counts[bins.of(mz)] += 1;
+                    }
                 }
-            }
-        });
+            });
+        (groups, table)
+    };
+    let (mut groups, mut table) = count();
+    if recount() {
+        drop(table);
+        (groups, table) = count();
+    }
     // Counts -> first write position of every (group, bin): bins in m/z order, and
     // within a bin the groups in item order. `bounds[b]..bounds[b + 1]` is bin b.
     let mut next = vec![0usize; nbins];
@@ -1256,6 +1404,71 @@ mod test {
     use super::*;
 
     #[test]
+    fn retain_indexed_keeps_order_across_blocks() {
+        let fragments = (0..200_003u32)
+            .map(|i| Theoretical {
+                peptide_index: PeptideIx(i % 1009),
+                fragment_mz: i as f32,
+            })
+            .collect::<Vec<_>>();
+        for keep in [
+            |ix: usize| ix % 3 != 1,
+            |_: usize| true,
+            |_: usize| false,
+            |ix: usize| ix == 7,
+        ] {
+            let indexed = (0..1009).map(keep).collect::<Vec<_>>();
+            let mut expected = fragments.clone();
+            expected.retain(|f| indexed[f.peptide_index.0 as usize]);
+            let mut kept = fragments.clone();
+            retain_indexed(&mut kept, &indexed);
+            assert_eq!(kept, expected);
+        }
+    }
+
+    /// The blocks of `retain_indexed` are moved in parallel waves: many blocks, kept shares
+    /// from almost none to almost all, and runs of dropped or kept blocks
+    #[test]
+    fn retain_indexed_moves_many_blocks() {
+        const BLOCK: usize = 1 << 16;
+        let n = 41 * BLOCK + 123;
+        // peptide i / 997 at position i: runs of ~66 peptides span about a block
+        let fragments = (0..n as u32)
+            .map(|i| Theoretical {
+                peptide_index: PeptideIx(i / 997),
+                fragment_mz: i as f32,
+            })
+            .collect::<Vec<_>>();
+        let peptides = n / 997 + 1;
+        let hash = |ix: usize| ix.wrapping_mul(2_654_435_761) % 1000;
+        let keeps: [&dyn Fn(usize) -> bool; 9] = [
+            &|ix| ix % 3 != 1,
+            &|ix| hash(ix) < 500,
+            &|ix| hash(ix) < 900,
+            &|ix| hash(ix) < 990,
+            &|ix| hash(ix) < 20,
+            &|ix| (ix / 66) % 2 == 0,
+            &|ix| (ix / 66) % 2 == 1,
+            &|ix| ix >= peptides / 2,
+            &|ix| ix == 1 || ix + 1 == peptides,
+        ];
+        for (k, keep) in keeps.iter().enumerate() {
+            let indexed = (0..peptides).map(keep).collect::<Vec<_>>();
+            let mut expected = fragments.clone();
+            expected.retain(|f| indexed[f.peptide_index.0 as usize]);
+            for threads in [1, 4] {
+                let pool = rayon::ThreadPoolBuilder::new()
+                    .num_threads(threads)
+                    .build()
+                    .unwrap();
+                let mut kept = fragments.clone();
+                pool.install(|| retain_indexed(&mut kept, &indexed));
+                assert!(kept == expected, "pattern {k}, {threads} threads");
+            }
+        }
+    }
+
+    #[test]
     fn binary_search_slice_smoke() {
         // Make sure that our query returns the maximal set of indices
         let data = [1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0];
@@ -1418,6 +1631,29 @@ mod test {
             .collect()
     }
 
+    /// [`Parameters::sorted_fragments_with`] with flags known from the start, or none
+    fn sorted_with(
+        params: &Parameters,
+        peptides: &[Peptide],
+        indexed: Option<Vec<bool>>,
+        chunk_size: usize,
+        max_bins: usize,
+        max_groups: usize,
+    ) -> Vec<Theoretical> {
+        let flags = OnceLock::new();
+        if let Some(indexed) = indexed {
+            flags.set(indexed).unwrap();
+        }
+        params.sorted_fragments_with(
+            peptides,
+            &flags,
+            &mut || false,
+            chunk_size,
+            max_bins,
+            max_groups,
+        )
+    }
+
     fn q99536_parameters(bucket_size: usize) -> Parameters {
         let mut builder = Builder {
             bucket_size: Some(bucket_size),
@@ -1459,14 +1695,15 @@ mod test {
         for max_bins in [2, 3, 64, 1000, MAX_BINS] {
             for chunk_size in [1, 7, 4096] {
                 for max_groups in [1, 3, 256] {
-                    let got = params
-                        .sorted_fragments_with(&peptides, None, chunk_size, max_bins, max_groups);
+                    let got =
+                        sorted_with(&params, &peptides, None, chunk_size, max_bins, max_groups);
                     assert_eq!(bits(&got), expected, "{max_bins} {chunk_size} {max_groups}");
                 }
             }
         }
 
-        // only marked peptides contribute, under their index in the complete list
+        // only marked peptides contribute, under their index in the complete list, whether
+        // the flags are there from the start or arrive after the counting pass
         let indexed = (0..peptides.len())
             .map(|ix| ix % 3 != 1)
             .collect::<Vec<_>>();
@@ -1477,30 +1714,47 @@ mod test {
             .collect::<Vec<_>>();
         for chunk_size in [1, 7, 4096] {
             for max_groups in [1, 3, 256] {
-                let got = params.sorted_fragments_with(
+                let got = sorted_with(
+                    &params,
                     &peptides,
-                    Some(&indexed),
+                    Some(indexed.clone()),
                     chunk_size,
                     MAX_BINS,
                     max_groups,
                 );
                 assert_eq!(bits(&got), marked, "{chunk_size} {max_groups}");
+                let flags = OnceLock::new();
+                let mut asked = 0;
+                let got = params.sorted_fragments_with(
+                    &peptides,
+                    &flags,
+                    &mut || {
+                        asked += 1;
+                        flags.set(indexed.clone()).is_ok()
+                    },
+                    chunk_size,
+                    MAX_BINS,
+                    max_groups,
+                );
+                assert_eq!(asked, 1);
+                assert_eq!(bits(&got), marked, "late, {chunk_size} {max_groups}");
             }
         }
         let none = vec![false; peptides.len()];
-        assert!(params
-            .sorted_fragments_with(&peptides, Some(&none), 7, MAX_BINS, 3)
-            .is_empty());
+        assert!(sorted_with(&params, &peptides, Some(none), 7, MAX_BINS, 3).is_empty());
         // the default grouping depends on the thread count, the result must not
         for threads in [1, 2, 7] {
             let pool = rayon::ThreadPoolBuilder::new()
                 .num_threads(threads)
                 .build()
                 .unwrap();
-            let got = pool.install(|| params.sorted_fragments(&peptides, None));
+            let got = pool
+                .install(|| params.sorted_fragments(&peptides, &OnceLock::new(), &mut || false));
             assert_eq!(bits(&got), expected, "{threads} threads");
         }
-        assert!(params.sorted_fragments(&[], None).is_empty());
+        assert!(params
+            .sorted_fragments(&[], &OnceLock::new(), &mut || false)
+            .is_empty());
 
         // fragments outside the guessed range (a1 ions below GUESS_LOW; masses above a
         // peptide mass that is too low) are sorted in the overflow bins
@@ -1512,14 +1766,14 @@ mod test {
         )));
         assert!(f32::from_bits(expected[0].1) < GUESS_LOW);
         for max_bins in [2, 64, MAX_BINS] {
-            let got = wide.sorted_fragments_with(&peptides, None, 7, max_bins, 5);
+            let got = sorted_with(&wide, &peptides, None, 7, max_bins, 5);
             assert_eq!(bits(&got), expected);
         }
         let mut light = peptides.clone();
         light.iter_mut().for_each(|p| p.monoisotopic = 100.0);
         let expected = bits(&stable_mz_sort(fragments_in_peptide_order(&params, &light)));
         assert_eq!(
-            bits(&params.sorted_fragments_with(&light, None, 7, MAX_BINS, 5)),
+            bits(&sorted_with(&params, &light, None, 7, MAX_BINS, 5)),
             expected
         );
     }
@@ -1612,6 +1866,7 @@ mod test {
             chunk_size,
             max_groups,
             scratch_share,
+            &mut || false,
         );
         // the order in which the m/z of one item arrive does not matter
         let reversed = binned_fragments(
@@ -1622,6 +1877,7 @@ mod test {
             chunk_size,
             max_groups,
             scratch_share,
+            &mut || false,
         );
         bits(&got) == expected && bits(&reversed) == expected
     }

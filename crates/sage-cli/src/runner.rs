@@ -68,37 +68,42 @@ impl Runner {
                 let paths = &parameters.mzml_paths;
                 let batch = &paths[..parallel.min(paths.len())];
                 if batch.len() == paths.len() {
-                    // Every spectrum that will be searched is in this batch: digest while
-                    // it is read, then index only the fragments of the peptides that one
-                    // of its precursor windows can reach. The peptide list (and so every
-                    // peptide index) stays complete and the results are identical; the
-                    // other peptides' fragments could never be counted (typically a third
-                    // to two thirds of all fragments).
+                    // Every spectrum that will be searched is in this batch: digest and
+                    // index while it is read, and leave out the fragments of the peptides
+                    // that none of its precursor windows can reach. The peptide list (and so
+                    // every peptide index) stays complete and the results are identical; the
+                    // other peptides' fragments could never be counted (typically a third to
+                    // two thirds of all fragments). The build never waits for the read: it
+                    // prunes from the first step at which the spectra are there (before the
+                    // fragments are counted, before the index is allocated, or before the
+                    // sorted fragments are bucketed) and otherwise indexes everything, as
+                    // before. At one thread `join` reads first.
                     let db_params = parameters.database.clone();
-                    let (peptides, spectra) = rayon::join(
-                        || db_params.digest(&fasta),
-                        || reader.read_processed_spectra(batch, 0, parallel),
+                    let read = std::sync::OnceLock::new();
+                    let ((), database) = rayon::join(
+                        || {
+                            let _ = read.set(reader.read_processed_spectra(batch, 0, parallel));
+                        },
+                        || {
+                            let peptides = db_params.digest(&fasta);
+                            db_params.build_pruned_when_ready(peptides, |probe| {
+                                // not read yet, or failed (reported below)
+                                let spectra: &Spectra = read.get()?.as_ref().ok()?;
+                                let reachable = reader.scorer(probe).reachable_peptides(
+                                    spectra.1.par_iter().filter(|spec| reader.searchable(spec)),
+                                );
+                                info!(
+                                    "indexing the fragments of {} of {} peptides (reachable from a precursor window)",
+                                    reachable.iter().filter(|&&r| r).count(),
+                                    reachable.len(),
+                                );
+                                Some(reachable)
+                            })
+                        },
                     );
                     drop(fasta);
-                    let spectra = spectra?;
-                    let mut probe = IndexedDatabase {
-                        peptides,
-                        ..Default::default()
-                    };
-                    let reachable = reader.scorer(&probe).reachable_peptides(
-                        spectra.1.par_iter().filter(|spec| reader.searchable(spec)),
-                    );
-                    let peptides = std::mem::take(&mut probe.peptides);
-                    info!(
-                        "indexing the fragments of {} of {} peptides (reachable from a precursor window)",
-                        reachable.iter().filter(|&&r| r).count(),
-                        peptides.len(),
-                    );
-                    first_batch = Some(spectra);
-                    parameters
-                        .database
-                        .clone()
-                        .build_reachable(peptides, &reachable)
+                    first_batch = Some(read.into_inner().expect("the read has finished")?);
+                    database
                 } else {
                     // Later batches are read after the index is built: index everything
                     let (database, spectra) = rayon::join(

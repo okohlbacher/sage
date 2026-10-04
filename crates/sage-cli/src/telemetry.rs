@@ -10,7 +10,10 @@ pub struct Telemetry {
     version: String,
     // How many peptides are in the fragment index?
     peptides: usize,
-    // How many fragments are in the index?
+    // How many fragments are in the index? When every input file is read in the first
+    // batch, the index holds only the fragments of the peptides that a precursor window
+    // of the searched spectra can reach (see `Runner::new`), so this can be well below
+    // the number of fragments of all peptides.
     fragments: usize,
     // How many files are being processed?
     files: usize,

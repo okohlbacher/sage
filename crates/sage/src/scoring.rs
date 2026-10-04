@@ -674,6 +674,9 @@ impl<'db> Scorer<'db> {
         &self,
         queries: impl IntoParallelIterator<Item = &'a ProcessedSpectrum>,
     ) -> Vec<bool> {
+        let n = self.db.peptides.len();
+        // peptide indices are u32 (`PeptideIx`): 8 bytes per window and isotope error
+        let last = u32::try_from(n.saturating_sub(1)).expect("more than 2^32 peptides");
         let ranges = queries
             .into_par_iter()
             .flat_map_iter(|query| {
@@ -684,26 +687,28 @@ impl<'db> Scorer<'db> {
                     .map(|precursor| self.precursor_windows(query, precursor))
                     .unwrap_or_default();
                 windows.into_iter().flat_map(move |(mass, _, tol)| {
-                    (self.min_isotope_err..=self.max_isotope_err).map(move |isotope| {
+                    (self.min_isotope_err..=self.max_isotope_err).filter_map(move |isotope| {
                         // as in `matched_peaks_isotope_windows` / `matched_peaks_with_isotope`
                         let candidates =
                             self.db
                                 .query(mass - isotope as f32 * NEUTRON, tol, self.fragment_tol);
-                        (candidates.pre_idx_lo, candidates.pre_idx_hi)
+                        // `pre_idx_hi` is `n` when no peptide lies above the window
+                        let (lo, hi) = (candidates.pre_idx_lo, candidates.pre_idx_hi);
+                        (lo < n && lo <= hi).then(|| (lo as u32, hi.min(last as usize) as u32))
                     })
                 })
             })
             .collect::<Vec<_>>();
 
-        let n = self.db.peptides.len();
+        // depth of the window ranges over each peptide (at most `ranges.len()`)
+        assert!(
+            ranges.len() <= i32::MAX as usize,
+            "too many precursor windows"
+        );
         let mut depth = vec![0i32; n + 1];
         for (lo, hi) in ranges {
-            // `pre_idx_hi` is `n` when no peptide lies above the window
-            let hi = hi.min(n.saturating_sub(1));
-            if lo < n && lo <= hi {
-                depth[lo] += 1;
-                depth[hi + 1] -= 1;
-            }
+            depth[lo as usize] += 1;
+            depth[hi as usize + 1] -= 1;
         }
         let mut open = 0;
         depth[..n]
@@ -1422,6 +1427,21 @@ mod tests {
             let reachable = scorer(&probe).reachable_peptides(&spectra);
             assert_eq!(reachable.len(), n);
             let pruned = params.clone().build_reachable(peptides.clone(), &reachable);
+            let lates = (0..4)
+                .map(|ready_at| {
+                    let mut asked = 0;
+                    let late = params
+                        .clone()
+                        .build_pruned_when_ready(peptides.clone(), |probe| {
+                            assert_eq!(probe.peptides.len(), n);
+                            assert!(probe.fragments.is_empty());
+                            asked += 1;
+                            (asked > ready_at).then(|| reachable.clone())
+                        });
+                    assert_eq!(asked, (ready_at + 1).min(3), "asked until it answered");
+                    late
+                })
+                .collect::<Vec<_>>();
             assert_eq!(pruned.peptides.len(), n);
             assert_eq!(
                 pruned.fragments.len(),
@@ -1453,6 +1473,22 @@ mod tests {
                 serde_json::to_string(&expected).unwrap(),
                 "case {case}"
             );
+
+            // The same flags arriving later in the build (after counting, after sorting)
+            // or never: the same index (the binned build's order is a total order), so the
+            // same PSMs
+            for (ready_at, late) in lates.iter().enumerate() {
+                let reference = if ready_at < 3 { &pruned } else { &full };
+                assert_eq!(late.peptides.len(), n);
+                assert_eq!(late.fragments, reference.fragments, "case {case}");
+                assert_eq!(late.min_value, reference.min_value, "case {case}");
+                assert_eq!(late.page_skip, reference.page_skip, "case {case}");
+                assert_eq!(
+                    serde_json::to_string(&psms(late)).unwrap(),
+                    serde_json::to_string(&expected).unwrap(),
+                    "case {case}, ready at step {ready_at}"
+                );
+            }
         }
     }
 
