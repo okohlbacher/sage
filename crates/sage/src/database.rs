@@ -256,6 +256,10 @@ impl Parameters {
                     .filter(|peptide| !peptide.decoy || !targets.contains(&(peptide.sequence[..])))
             })
             .collect::<Vec<_>>();
+        // Free the target sequences now, before the sort, and in parallel: many threads
+        // allocated them, and one thread freeing them took 0.15-0.3 s at >= 4 threads
+        // (mimalloc cross-thread frees)
+        targets.into_par_iter().for_each(drop);
 
         // `digest` already removed decoys colliding with targets
         Self::sort_and_dedup(&mut target_decoys);
