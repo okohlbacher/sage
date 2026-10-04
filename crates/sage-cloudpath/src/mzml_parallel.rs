@@ -12,10 +12,12 @@
 //!    footer that closes the elements the header opens;
 //! 3. parse: chunks of whole spectra, each read by the task that parses it and passed through
 //!    `f`; the results are concatenated in file order. The last chunk runs to the real end of
-//!    the file, so a truncated file is detected as before.
+//!    the file, so a truncated file is detected as before; it is streamed (everything after
+//!    the spectra, e.g. a large chromatogram list, goes through a [`STREAM`] buffer as in the
+//!    serial reader).
 //!
-//! Memory is bounded by the chunks in flight (one per worker, at most [`MAX_CHUNK`] bytes and
-//! their raw spectra) instead of the whole file's raw spectra.
+//! Memory is bounded by the chunks in flight (one per worker, about [`MAX_CHUNK`] bytes plus
+//! one spectrum, and their raw spectra) instead of the whole file's raw spectra.
 //!
 //! The spectra are those of the serial parse: the parser keeps no state from one spectrum to
 //! the next except the header's param groups (every per-spectrum field is reset at
@@ -43,6 +45,23 @@ const MIN_CHUNK: usize = 256 << 10;
 const MAX_CHUNK: usize = 8 << 20;
 /// Every chunk re-parses the header; larger headers go to the serial reader
 const MAX_HEADER: usize = 256 << 10;
+/// Read size of the streamed last chunk (as the serial reader's)
+const STREAM: usize = 2 << 20;
+
+/// A blocking reader as a tokio reader, for the parser driven by `block_on` on a rayon thread
+struct Blocking<R>(R);
+
+impl<R: std::io::Read + Unpin> tokio::io::AsyncRead for Blocking<R> {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let n = self.get_mut().0.read(buf.initialize_unfilled())?;
+        buf.advance(n);
+        std::task::Poll::Ready(Ok(()))
+    }
+}
 
 const START: &[u8] = b"<spectrum";
 const END: &[u8] = b"</spectrum>";
@@ -246,18 +265,27 @@ pub(crate) fn read_processed<T: Send>(
     let parsed = (0..chunks)
         .into_par_iter()
         .map_init(Vec::new, |input, k| {
-            // header + chunk + footer, in a buffer the worker reuses
             let (a, b) = (bounds[k], bounds[k + 1]);
-            input.clear();
-            input.extend_from_slice(&header);
-            input.resize(header.len() + (b - a) as usize, 0);
-            read_at(&file, &mut input[header.len()..], a).ok()?;
-            if k + 1 < chunks {
-                input.extend_from_slice(&footer);
-            }
             let mut reader = MzMLReader::with_file_id(file_id);
             reader.set_signal_to_noise(sn).set_skip_ms1(skip_ms1);
-            let raw = futures::executor::block_on(reader.parse(&input[..])).ok()?;
+            let raw = if k + 1 < chunks {
+                // header + chunk + footer, in a buffer the worker reuses
+                input.clear();
+                input.extend_from_slice(&header);
+                input.resize(header.len() + (b - a) as usize, 0);
+                read_at(&file, &mut input[header.len()..], a).ok()?;
+                input.extend_from_slice(&footer);
+                futures::executor::block_on(reader.parse(&input[..])).ok()?
+            } else {
+                // header + the rest of the file, streamed: what follows the spectra
+                // (chromatograms, index) can be much larger than a chunk
+                use std::io::{Read, Seek};
+                let mut rest = File::open(path).ok()?;
+                rest.seek(std::io::SeekFrom::Start(a)).ok()?;
+                let src = Blocking((&header[..]).chain(rest));
+                let src = tokio::io::BufReader::with_capacity(STREAM, src);
+                futures::executor::block_on(reader.parse(src)).ok()?
+            };
             Some(raw.into_iter().map(f).collect::<Vec<T>>())
         })
         .collect::<Option<Vec<Vec<T>>>>()
@@ -531,5 +559,41 @@ mod test {
         std::fs::remove_file(&path).ok();
         assert_eq!(parallel.len(), 32);
         assert_eq!(parallel, serial);
+    }
+
+    #[test]
+    fn a_large_tail_after_the_spectra_is_streamed_and_checked() {
+        // chromatograms after the spectra (the last chunk runs to the end of the file)
+        let content = synthetic(20, "\n");
+        let chrom = |i: usize| {
+            format!(
+                "<chromatogram index=\"{i}\" id=\"SIC {i}\" defaultArrayLength=\"1\"><binaryDataArrayList count=\"1\"><binaryDataArray encodedLength=\"8\"><cvParam cvRef=\"MS\" accession=\"MS:1000523\" name=\"64-bit float\" value=\"\"/><cvParam cvRef=\"MS\" accession=\"MS:1000576\" name=\"no compression\" value=\"\"/><cvParam cvRef=\"MS\" accession=\"MS:1000595\" name=\"time array\" value=\"\"/><binary>{}</binary></binaryDataArray></binaryDataArrayList></chromatogram>\n",
+                "AAAAAAAA8D8=".repeat(400)
+            )
+        };
+        let list: String = (0..300).map(chrom).collect();
+        let content = content.replacen(
+            "</spectrumList>",
+            &format!(
+                "</spectrumList>\n<chromatogramList count=\"300\">\n{list}</chromatogramList>"
+            ),
+            1,
+        );
+        let expected = serial(&content, false, None).unwrap();
+        assert_eq!(expected.len(), 20);
+        for chunk in [Some(1), Some(20_000), None, Some(1 << 30)] {
+            let sizes = Sizes { piece: 4096, chunk };
+            assert!(same(
+                &expected,
+                &parallel("tail", &content, false, None, sizes).unwrap()
+            ));
+        }
+        // truncated inside the chromatogram list: an error, as in the serial reader
+        let cut = content.find("<chromatogram index=\"150\"").unwrap() + 100;
+        assert!(serial(&content[..cut], false, None).is_err());
+        for chunk in [Some(1), Some(1 << 30)] {
+            let sizes = Sizes { piece: 4096, chunk };
+            assert!(parallel("tailcut", &content[..cut], false, None, sizes).is_err());
+        }
     }
 }
