@@ -86,16 +86,25 @@ pub struct Input {
     pub score_type: Option<ScoreType>,
 }
 
-/// `max_peaks` as written in the configuration: a number of peaks, or `"auto"` (the default)
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+/// `max_peaks` as written in the configuration: a number of peaks, or `"auto"`.
+/// Not set means [`MaxPeaks::DEFAULT`] peaks (see [`MaxPeaks::default`]).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum MaxPeaks {
-    /// Depends on the fragment tolerance (see [`MaxPeaks::resolve`])
-    #[default]
+    /// Depends on the fragment tolerance and the search mode (see [`MaxPeaks::resolve`])
     Auto,
     Count(usize),
 }
 
+impl Default for MaxPeaks {
+    /// `max_peaks` not set: a fixed [`MaxPeaks::DEFAULT`] peaks
+    fn default() -> Self {
+        MaxPeaks::Count(Self::DEFAULT)
+    }
+}
+
 impl MaxPeaks {
+    /// Peaks kept per MS2 spectrum when `max_peaks` is not set
+    pub const DEFAULT: usize = 150;
     /// Peaks kept per MS2 spectrum by `"auto"` for high-resolution fragment spectra
     pub const AUTO_HIGH_RES: usize = 400;
     /// Peaks kept per MS2 spectrum by `"auto"` for low-resolution fragment spectra
@@ -103,8 +112,12 @@ impl MaxPeaks {
     pub const AUTO_LOW_RES: usize = 80;
     /// Peaks kept per MS2 spectrum by `"auto"` for low-resolution fragment spectra when TMT
     /// reporter ions are quantified from the MS2 spectra (`quant.tmt_settings.level` 2): the
-    /// former fixed default, because 80 peaks drop reporter ions
+    /// fixed default, because 80 peaks drop reporter ions
     pub const AUTO_LOW_RES_TMT_MS2: usize = 150;
+    /// Peaks kept per MS2 spectrum by `"auto"` in a wide-window search (`wide_window: true`),
+    /// whatever the resolution: the fixed default. With 400 peaks, wrong candidates from the
+    /// wide isolation window win more often (3-46% fewer PSMs on high-resolution data)
+    pub const AUTO_WIDE_WINDOW: usize = 150;
     /// A Da fragment tolerance reaching this value (on at least one side) means low resolution
     pub const LOW_RES_DA: f32 = 0.1;
 
@@ -118,13 +131,16 @@ impl MaxPeaks {
     }
 
     /// The number of peaks to keep per MS2 spectrum: an explicit count as given; `"auto"`
-    /// gives [`MaxPeaks::AUTO_HIGH_RES`] for a ppm or pct fragment tolerance or a narrow Da
+    /// gives [`MaxPeaks::AUTO_WIDE_WINDOW`] if `wide_window` (a wide-window search), else
+    /// [`MaxPeaks::AUTO_HIGH_RES`] for a ppm or pct fragment tolerance or a narrow Da
     /// tolerance (such as ±0.02 Da); for a Da tolerance reaching [`MaxPeaks::LOW_RES_DA`] it
     /// gives [`MaxPeaks::AUTO_LOW_RES`], or [`MaxPeaks::AUTO_LOW_RES_TMT_MS2`] if `tmt_ms2`
-    /// (TMT reporter ions are quantified from the MS2 spectra)
-    pub fn resolve(self, fragment_tol: &Tolerance, tmt_ms2: bool) -> usize {
+    /// (TMT reporter ions are quantified from the MS2 spectra).
+    /// [`Input::build`] then raises a resolved `"auto"` to `min_peaks` if it is lower.
+    pub fn resolve(self, fragment_tol: &Tolerance, tmt_ms2: bool, wide_window: bool) -> usize {
         match self {
             MaxPeaks::Count(n) => n,
+            MaxPeaks::Auto if wide_window => Self::AUTO_WIDE_WINDOW,
             MaxPeaks::Auto if !Self::low_resolution(fragment_tol) => Self::AUTO_HIGH_RES,
             MaxPeaks::Auto if tmt_ms2 => Self::AUTO_LOW_RES_TMT_MS2,
             MaxPeaks::Auto => Self::AUTO_LOW_RES,
@@ -452,20 +468,45 @@ impl Input {
         let quant: QuantSettings = self.quant.map(Into::into).unwrap_or_default();
         // TMT reporter ions quantified from the MS2 spectra must survive the peak cap
         let tmt_ms2 = quant.tmt.is_some() && quant.tmt_settings.level == 2;
+        let wide_window = self.wide_window.unwrap_or(false);
+        let min_peaks = self.min_peaks.unwrap_or(15);
         let max_peaks = self.max_peaks.unwrap_or_default();
-        let max_peaks_resolved = max_peaks.resolve(&self.fragment_tol, tmt_ms2);
+        let mut max_peaks_resolved = max_peaks.resolve(&self.fragment_tol, tmt_ms2, wide_window);
         if max_peaks == MaxPeaks::Auto {
+            // A spectrum is searched only if at least `min_peaks` peaks survive the top-N cut
+            // (`Runner::searchable`): "auto" never keeps fewer than that
+            let raised = max_peaks_resolved < min_peaks;
+            max_peaks_resolved = max_peaks_resolved.max(min_peaks);
             let low_resolution = MaxPeaks::low_resolution(&self.fragment_tol);
+            let reason = if wide_window {
+                "wide_window: the fixed default, whatever the resolution".to_string()
+            } else {
+                format!(
+                    "{:?} fragment tolerance: {} resolution{}",
+                    self.fragment_tol,
+                    if low_resolution { "low" } else { "high" },
+                    if low_resolution && tmt_ms2 {
+                        ", TMT reporter ions quantified from MS2"
+                    } else {
+                        ""
+                    },
+                )
+            };
             log::info!(
-                "max_peaks: auto -> {} peaks per MS2 spectrum ({:?} fragment tolerance: {} resolution{})",
+                "max_peaks: auto -> {} peaks per MS2 spectrum ({}{})",
                 max_peaks_resolved,
-                self.fragment_tol,
-                if low_resolution { "low" } else { "high" },
-                if low_resolution && tmt_ms2 {
-                    ", TMT reporter ions quantified from MS2"
+                reason,
+                if raised {
+                    format!("; raised to min_peaks {}", min_peaks)
                 } else {
-                    ""
+                    String::new()
                 },
+            );
+        } else if max_peaks_resolved < min_peaks {
+            log::warn!(
+                "max_peaks {} is below min_peaks {}: no MS2 spectrum can be searched",
+                max_peaks_resolved,
+                min_peaks
             );
         }
 
@@ -479,7 +520,7 @@ impl Input {
             fragment_tol: self.fragment_tol,
             report_psms: self.report_psms.unwrap_or(1),
             max_peaks: max_peaks_resolved,
-            min_peaks: self.min_peaks.unwrap_or(15),
+            min_peaks,
             min_matched_peaks: self.min_matched_peaks.unwrap_or(4),
             max_fragment_charge: self.max_fragment_charge,
             annotate_matches: self.annotate_matches.unwrap_or(false),
@@ -488,7 +529,7 @@ impl Input {
             isotope_errors: self.isotope_errors.unwrap_or((0, 0)),
             deisotope: self.deisotope.unwrap_or(true),
             chimera: self.chimera.unwrap_or(false),
-            wide_window: self.wide_window.unwrap_or(false),
+            wide_window,
             predict_rt: self.predict_rt.unwrap_or(true),
             output_paths: Vec::new(),
             write_pin: self.write_pin.unwrap_or(false),
@@ -505,8 +546,27 @@ impl Input {
 #[cfg(test)]
 mod test {
 
-    use super::{Input, MaxPeaks};
+    use super::{Input, MaxPeaks, Search};
     use sage_core::{database::EnzymeBuilder, enzyme::EnzymeParameters, mass::Tolerance};
+
+    /// The resolved search parameters for a minimal configuration with `extra` keys added
+    fn resolved(
+        fragment_tol: serde_json::Value,
+        extra: serde_json::Value,
+    ) -> anyhow::Result<Search> {
+        let mut config = serde_json::json!({
+            "database": { "fasta": "proteins.fasta" },
+            "precursor_tol": { "ppm": [-10.0, 10.0] },
+            "fragment_tol": fragment_tol,
+            // a URL is not resolved on disk (a local path must exist)
+            "mzml_paths": ["s3://bucket/spectra.mzML"],
+        });
+        for (key, value) in extra.as_object().expect("extra keys are an object") {
+            config[key] = value.clone();
+        }
+        let input: Input = serde_json::from_value(config)?;
+        input.build()
+    }
 
     /// `max_peaks` of the resolved search parameters for a minimal configuration
     fn resolved_max_peaks(
@@ -522,21 +582,47 @@ mod test {
         max_peaks: Option<serde_json::Value>,
         quant: Option<serde_json::Value>,
     ) -> anyhow::Result<usize> {
-        let mut config = serde_json::json!({
-            "database": { "fasta": "proteins.fasta" },
-            "precursor_tol": { "ppm": [-10.0, 10.0] },
-            "fragment_tol": fragment_tol,
-            // a URL is not resolved on disk (a local path must exist)
-            "mzml_paths": ["s3://bucket/spectra.mzML"],
-        });
+        let mut extra = serde_json::json!({});
         if let Some(max_peaks) = max_peaks {
-            config["max_peaks"] = max_peaks;
+            extra["max_peaks"] = max_peaks;
         }
         if let Some(quant) = quant {
-            config["quant"] = quant;
+            extra["quant"] = quant;
         }
-        let input: Input = serde_json::from_value(config)?;
-        Ok(input.build()?.max_peaks)
+        Ok(resolved(fragment_tol, extra)?.max_peaks)
+    }
+
+    #[test]
+    fn max_peaks_default_is_150() -> anyhow::Result<()> {
+        use serde_json::json;
+        let tmt_ms2 = json!({ "tmt": "Tmt16", "tmt_settings": { "level": 2 } });
+        assert_eq!(MaxPeaks::default(), MaxPeaks::Count(150));
+        assert_eq!(MaxPeaks::DEFAULT, 150);
+        // not set and null are the fixed default, whatever the tolerance, TMT or search mode
+        for tol in [
+            json!({ "ppm": [-20.0, 20.0] }),
+            json!({ "da": [-0.5, 0.5] }),
+            json!({ "da": [-0.02, 0.02] }),
+            json!({ "pct": [-0.002, 0.002] }),
+        ] {
+            for max_peaks in [None, Some(json!(null))] {
+                assert_eq!(resolved_max_peaks(tol.clone(), max_peaks.clone())?, 150);
+                assert_eq!(
+                    resolved_max_peaks_quant(
+                        tol.clone(),
+                        max_peaks.clone(),
+                        Some(tmt_ms2.clone())
+                    )?,
+                    150
+                );
+                let mut extra = json!({ "wide_window": true });
+                if let Some(max_peaks) = max_peaks {
+                    extra["max_peaks"] = max_peaks;
+                }
+                assert_eq!(resolved(tol.clone(), extra)?.max_peaks, 150);
+            }
+        }
+        Ok(())
     }
 
     #[test]
@@ -547,24 +633,19 @@ mod test {
         let narrow_da = json!({ "da": [-0.02, 0.02] });
         let pct = json!({ "pct": [-0.002, 0.002] });
 
-        // not set, null and "auto" are the same: 400 for ppm, pct and narrow Da, 80 for wide Da
-        for max_peaks in [None, Some(json!(null)), Some(json!("auto"))] {
-            assert_eq!(resolved_max_peaks(ppm.clone(), max_peaks.clone())?, 400);
-            assert_eq!(resolved_max_peaks(pct.clone(), max_peaks.clone())?, 400);
-            assert_eq!(
-                resolved_max_peaks(narrow_da.clone(), max_peaks.clone())?,
-                400
-            );
-            assert_eq!(resolved_max_peaks(da.clone(), max_peaks)?, 80);
-        }
+        // "auto": 400 for ppm, pct and narrow Da, 80 for wide Da
+        let auto = Some(json!("auto"));
+        assert_eq!(resolved_max_peaks(ppm.clone(), auto.clone())?, 400);
+        assert_eq!(resolved_max_peaks(pct.clone(), auto.clone())?, 400);
+        assert_eq!(resolved_max_peaks(narrow_da.clone(), auto.clone())?, 400);
+        assert_eq!(resolved_max_peaks(da.clone(), auto)?, 80);
         // an explicit number is used as given, whatever the tolerance
         for tol in [&ppm, &da, &narrow_da, &pct] {
             assert_eq!(resolved_max_peaks(tol.clone(), Some(json!(150)))?, 150);
             assert_eq!(resolved_max_peaks(tol.clone(), Some(json!(0)))?, 0);
         }
 
-        assert_eq!(MaxPeaks::default(), MaxPeaks::Auto);
-        let auto = |tol: Tolerance| MaxPeaks::Auto.resolve(&tol, false);
+        let auto = |tol: Tolerance| MaxPeaks::Auto.resolve(&tol, false, false);
         assert_eq!(auto(Tolerance::Ppm(-5.0, 5.0)), MaxPeaks::AUTO_HIGH_RES);
         assert_eq!(auto(Tolerance::Ppm(-500.0, 500.0)), MaxPeaks::AUTO_HIGH_RES);
         assert_eq!(auto(Tolerance::Da(-0.05, 0.05)), MaxPeaks::AUTO_HIGH_RES);
@@ -575,7 +656,7 @@ mod test {
         assert_eq!(auto(Tolerance::Da(-0.5, 0.0)), MaxPeaks::AUTO_LOW_RES);
         assert_eq!(auto(Tolerance::Da(-0.01, 0.4)), MaxPeaks::AUTO_LOW_RES);
         assert_eq!(
-            MaxPeaks::Count(42).resolve(&Tolerance::Da(-0.5, 0.5), false),
+            MaxPeaks::Count(42).resolve(&Tolerance::Da(-0.5, 0.5), false, false),
             42
         );
         Ok(())
@@ -592,16 +673,16 @@ mod test {
         let tmt_default = json!({ "tmt": "Tmt16" }); // level 3
         let lfq = json!({ "lfq": true });
         let auto = |tol: &serde_json::Value, quant: &serde_json::Value| {
-            resolved_max_peaks_quant(tol.clone(), None, Some(quant.clone()))
+            resolved_max_peaks_quant(tol.clone(), Some(json!("auto")), Some(quant.clone()))
         };
 
-        // low resolution with reporter ions read from MS2: the former default
+        // low resolution with reporter ions read from MS2: the fixed default
         assert_eq!(auto(&da, &tmt_ms2)?, MaxPeaks::AUTO_LOW_RES_TMT_MS2);
         // reporter ions from MS3 (not capped), or no TMT: unchanged
         assert_eq!(auto(&da, &tmt_ms3)?, MaxPeaks::AUTO_LOW_RES);
         assert_eq!(auto(&da, &tmt_default)?, MaxPeaks::AUTO_LOW_RES);
         assert_eq!(auto(&da, &lfq)?, MaxPeaks::AUTO_LOW_RES);
-        // high resolution keeps more peaks than the former default anyway
+        // high resolution keeps more peaks than the fixed default anyway
         assert_eq!(auto(&ppm, &tmt_ms2)?, MaxPeaks::AUTO_HIGH_RES);
         assert_eq!(auto(&narrow_da, &tmt_ms2)?, MaxPeaks::AUTO_HIGH_RES);
         // an explicit number is used as given
@@ -610,9 +691,109 @@ mod test {
             60
         );
         assert_eq!(
-            MaxPeaks::Auto.resolve(&Tolerance::Da(-0.5, 0.5), true),
+            MaxPeaks::Auto.resolve(&Tolerance::Da(-0.5, 0.5), true, false),
             MaxPeaks::AUTO_LOW_RES_TMT_MS2
         );
+        Ok(())
+    }
+
+    #[test]
+    fn max_peaks_auto_keeps_150_in_wide_window_searches() -> anyhow::Result<()> {
+        use serde_json::json;
+        let tmt_ms2 = json!({ "tmt": "Tmt16", "tmt_settings": { "level": 2 } });
+        for tol in [
+            json!({ "ppm": [-20.0, 20.0] }),
+            json!({ "da": [-0.5, 0.5] }),
+            json!({ "da": [-0.02, 0.02] }),
+            json!({ "pct": [-0.002, 0.002] }),
+        ] {
+            let ww = |extra: serde_json::Value| -> anyhow::Result<usize> {
+                let mut extra = extra;
+                extra["wide_window"] = json!(true);
+                Ok(resolved(tol.clone(), extra)?.max_peaks)
+            };
+            assert_eq!(
+                ww(json!({ "max_peaks": "auto" }))?,
+                MaxPeaks::AUTO_WIDE_WINDOW
+            );
+            assert_eq!(
+                ww(json!({ "max_peaks": "auto", "quant": tmt_ms2 }))?,
+                MaxPeaks::AUTO_WIDE_WINDOW
+            );
+            // an explicit number is used as given
+            assert_eq!(ww(json!({ "max_peaks": 400 }))?, 400);
+            assert_eq!(ww(json!({ "max_peaks": 80 }))?, 80);
+            // wide_window false: the resolution rule
+            let narrow = resolved(
+                tol.clone(),
+                json!({ "max_peaks": "auto", "wide_window": false }),
+            )?;
+            assert_ne!(narrow.max_peaks, MaxPeaks::AUTO_WIDE_WINDOW);
+            assert!(narrow.max_peaks == 400 || narrow.max_peaks == 80);
+        }
+        assert_eq!(MaxPeaks::AUTO_WIDE_WINDOW, 150);
+        for tol in [Tolerance::Ppm(-10.0, 10.0), Tolerance::Da(-0.5, 0.5)] {
+            for tmt_ms2 in [false, true] {
+                assert_eq!(
+                    MaxPeaks::Auto.resolve(&tol, tmt_ms2, true),
+                    MaxPeaks::AUTO_WIDE_WINDOW
+                );
+                assert_eq!(MaxPeaks::Count(7).resolve(&tol, tmt_ms2, true), 7);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn max_peaks_auto_keeps_at_least_min_peaks() -> anyhow::Result<()> {
+        use sage_core::spectrum::{Precursor, RawSpectrum, Representation, SpectrumProcessor};
+        use serde_json::json;
+        let da = json!({ "da": [-0.5, 0.5] });
+        let ppm = json!({ "ppm": [-20.0, 20.0] });
+
+        // "auto" -> 80 for 0.5 Da is raised to min_peaks 100, so spectra stay searchable
+        let search = resolved(da.clone(), json!({ "max_peaks": "auto", "min_peaks": 100 }))?;
+        assert_eq!((search.max_peaks, search.min_peaks), (100, 100));
+        // at or below the resolved value: unchanged
+        let search = resolved(da.clone(), json!({ "max_peaks": "auto", "min_peaks": 80 }))?;
+        assert_eq!((search.max_peaks, search.min_peaks), (80, 80));
+        let search = resolved(
+            ppm.clone(),
+            json!({ "max_peaks": "auto", "min_peaks": 100 }),
+        )?;
+        assert_eq!((search.max_peaks, search.min_peaks), (400, 100));
+        // wide window: 150, raised to a higher min_peaks
+        let search = resolved(
+            ppm.clone(),
+            json!({ "max_peaks": "auto", "wide_window": true, "min_peaks": 200 }),
+        )?;
+        assert_eq!((search.max_peaks, search.min_peaks), (200, 200));
+        // an explicit number or the default is used as given (a warning is logged)
+        let search = resolved(da.clone(), json!({ "max_peaks": 50, "min_peaks": 100 }))?;
+        assert_eq!((search.max_peaks, search.min_peaks), (50, 100));
+        let search = resolved(da.clone(), json!({ "min_peaks": 200 }))?;
+        assert_eq!((search.max_peaks, search.min_peaks), (150, 200));
+
+        // end to end: a 300-peak MS2 spectrum keeps min_peaks peaks with "auto"
+        let search = resolved(da, json!({ "max_peaks": "auto", "min_peaks": 100 }))?;
+        let mz: Vec<f32> = (0..300).map(|i| 200.0 + 4.0 * i as f32).collect();
+        let intensity: Vec<f32> = (0..300).map(|i| 1.0 + i as f32).collect();
+        let spectrum = RawSpectrum {
+            ms_level: 2,
+            id: "scan=1".into(),
+            precursors: vec![Precursor {
+                mz: 800.0,
+                charge: Some(2),
+                ..Default::default()
+            }],
+            representation: Representation::Centroid,
+            mz,
+            intensity,
+            ..Default::default()
+        };
+        let processed = SpectrumProcessor::new(search.max_peaks, false, 0.0).process(spectrum);
+        assert_eq!(processed.masses.len(), 100);
+        assert!(processed.masses.len() >= search.min_peaks);
         Ok(())
     }
 
