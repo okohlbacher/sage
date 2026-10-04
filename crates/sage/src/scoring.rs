@@ -3,6 +3,7 @@ use crate::heap::bounded_min_heapify;
 use crate::ion_series::{IonSeries, Kind};
 use crate::mass::{Tolerance, NEUTRON, PROTON};
 use crate::spectrum::{Precursor, ProcessedSpectrum};
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::ops::AddAssign;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -601,65 +602,117 @@ impl<'db> Scorer<'db> {
         (charges.len() > 1).then_some(charges)
     }
 
-    fn initial_hits(&self, query: &ProcessedSpectrum, precursor: &Precursor) -> InitialHits {
+    /// Precursor windows `(mass, charge, tolerance)` that [`Self::initial_hits`] searches
+    /// for `precursor`, in search order; each one is searched at every isotope error.
+    /// [`Self::reachable_peptides`] uses the same windows, so these rules live only here.
+    fn precursor_windows(
+        &self,
+        query: &ProcessedSpectrum,
+        precursor: &Precursor,
+    ) -> Vec<(f32, u8, Tolerance)> {
         // Sage operates on masses without protons; [M] instead of [MH+]
         let mz = precursor.mz - PROTON;
+        let window = |charge: u8, tol: Tolerance| (mz * charge as f32, charge, tol);
 
-        // Search in wide-window/DIA mode
-        let mut hits = if self.wide_window {
-            (self.min_precursor_charge..=self.max_precursor_charge).fold(
-                InitialHits::default(),
-                |mut hits, precursor_charge| {
-                    let precursor_mass = mz * precursor_charge as f32;
-                    let precursor_tol = precursor
+        if self.wide_window {
+            // Search in wide-window/DIA mode
+            (self.min_precursor_charge..=self.max_precursor_charge)
+                .map(|charge| {
+                    let tol = precursor
                         .isolation_window
                         .unwrap_or(Tolerance::Da(-2.4, 2.4))
-                        * precursor_charge as f32;
-                    hits +=
-                        self.matched_peaks(query, precursor_mass, precursor_charge, precursor_tol);
-                    hits
-                },
-            )
+                        * charge as f32;
+                    window(charge, tol)
+                })
+                .collect()
         } else if let Some(charges) = self.listed_charges(query, precursor) {
             // Several candidate charges were listed for this precursor (MGF "2+ and 3+"):
             // search exactly those. Only the first precursor used to be searched.
             charges
                 .into_iter()
-                .fold(InitialHits::default(), |mut hits, precursor_charge| {
-                    let precursor_mass = mz * precursor_charge as f32;
-                    hits += self.matched_peaks(
-                        query,
-                        precursor_mass,
-                        precursor_charge,
-                        self.precursor_tol,
-                    );
-                    hits
-                })
-        } else if precursor.charge.is_some() && !self.override_precursor_charge {
-            let charge = precursor.charge.unwrap();
+                .map(|charge| window(charge, self.precursor_tol))
+                .collect()
+        } else if let (Some(charge), false) = (precursor.charge, self.override_precursor_charge) {
             // Charge state is already annotated for this precusor, only search once
-            let precursor_mass = mz * charge as f32;
-            self.matched_peaks(query, precursor_mass, charge, self.precursor_tol)
+            vec![window(charge, self.precursor_tol)]
         } else {
             // Not all selected ion precursors have charge states annotated (or user has set
             // `override_precursor_charge`)
             // assume it could be z=2, z=3, z=4 and search all three
-            (self.min_precursor_charge..=self.max_precursor_charge).fold(
-                InitialHits::default(),
-                |mut hits, precursor_charge| {
-                    let precursor_mass = mz * precursor_charge as f32;
-                    hits += self.matched_peaks(
-                        query,
-                        precursor_mass,
-                        precursor_charge,
-                        self.precursor_tol,
-                    );
-                    hits
-                },
-            )
+            (self.min_precursor_charge..=self.max_precursor_charge)
+                .map(|charge| window(charge, self.precursor_tol))
+                .collect()
+        }
+    }
+
+    fn initial_hits(&self, query: &ProcessedSpectrum, precursor: &Precursor) -> InitialHits {
+        let mut windows = self.precursor_windows(query, precursor).into_iter();
+        let mut hits = match windows.next() {
+            Some((mass, charge, tol)) => self.matched_peaks(query, mass, charge, tol),
+            None => InitialHits::default(),
         };
+        for (mass, charge, tol) in windows {
+            hits += self.matched_peaks(query, mass, charge, tol);
+        }
         self.trim_hits(&mut hits);
         hits
+    }
+
+    /// Which peptides of the database preliminary scoring of `queries` can reach, one
+    /// flag per peptide.
+    ///
+    /// For every precursor window and isotope error, preliminary scoring allocates and
+    /// counts only the peptides `pre_idx_lo..=pre_idx_hi` of [`IndexedDatabase::query`].
+    /// This marks the union of these ranges over all windows of all queries, found by the
+    /// same calls ([`Self::precursor_windows`], the same isotope arithmetic and
+    /// `query`). A fragment index built from the marked peptides' fragments alone
+    /// ([`crate::database::Parameters::build_reachable`]), over the same peptide list,
+    /// therefore gives every one of these queries the same candidate arrays, counts and
+    /// order, and so the same results. Only `db.peptides` is used: the fragment index may
+    /// still be empty. `queries` must contain every spectrum that will be scored.
+    pub fn reachable_peptides<'a>(
+        &self,
+        queries: impl IntoParallelIterator<Item = &'a ProcessedSpectrum>,
+    ) -> Vec<bool> {
+        let ranges = queries
+            .into_par_iter()
+            .flat_map_iter(|query| {
+                // the scorer searches the first precursor only
+                let windows = query
+                    .precursors
+                    .first()
+                    .map(|precursor| self.precursor_windows(query, precursor))
+                    .unwrap_or_default();
+                windows.into_iter().flat_map(move |(mass, _, tol)| {
+                    (self.min_isotope_err..=self.max_isotope_err).map(move |isotope| {
+                        // as in `matched_peaks_isotope_windows` / `matched_peaks_with_isotope`
+                        let candidates =
+                            self.db
+                                .query(mass - isotope as f32 * NEUTRON, tol, self.fragment_tol);
+                        (candidates.pre_idx_lo, candidates.pre_idx_hi)
+                    })
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let n = self.db.peptides.len();
+        let mut depth = vec![0i32; n + 1];
+        for (lo, hi) in ranges {
+            // `pre_idx_hi` is `n` when no peptide lies above the window
+            let hi = hi.min(n.saturating_sub(1));
+            if lo < n && lo <= hi {
+                depth[lo] += 1;
+                depth[hi + 1] -= 1;
+            }
+        }
+        let mut open = 0;
+        depth[..n]
+            .iter()
+            .map(|d| {
+                open += d;
+                open > 0
+            })
+            .collect()
     }
 
     /// Score a single [`ProcessedSpectrum`] against the database
@@ -1196,6 +1249,210 @@ mod tests {
                 assert_eq!(none.matched_peaks, 0);
                 assert_eq!(none.preliminary, reference.preliminary);
             }
+        }
+    }
+
+    /// Indexing only the fragments of the peptides that the spectra's precursor windows
+    /// reach (peptide list unchanged) must give exactly the same PSMs
+    #[test]
+    fn reachable_index_gives_identical_results() {
+        let fasta = crate::fasta::Fasta::parse(
+            include_str!("../../../tests/Q99536.fasta").into(),
+            "rev_",
+            true,
+        );
+        let mut builder = Builder {
+            // many small pages: pruning moves every page boundary
+            bucket_size: Some(64),
+            enzyme: Some(EnzymeBuilder {
+                missed_cleavages: Some(2),
+                min_len: Some(5),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        builder.update_fasta("unused".into());
+        let params = builder.make_parameters();
+        let peptides = params.digest(&fasta);
+        let full = params.clone().build_from_peptides(peptides.clone());
+        let n = full.peptides.len();
+
+        // Spectra: fragments of a target peptide plus some of its mass neighbours'
+        // (competing and tied candidates), at several charges and isotope offsets, with
+        // unannotated, annotated and listed ("2+ and 3+") charges
+        let mut spectra = Vec::new();
+        let targets = (0..n).filter(|&ix| !full.peptides[ix].decoy).step_by(5);
+        for (k, target) in targets.take(24).enumerate() {
+            let neighbours = [target, (target + 1).min(n - 1), target.saturating_sub(2)];
+            let mut mz = full
+                .fragments
+                .iter()
+                .filter(|f| {
+                    let ix = f.peptide_index.0 as usize;
+                    ix == target || (neighbours.contains(&ix) && (f.fragment_mz as usize) % 3 == 0)
+                })
+                .map(|f| f.fragment_mz + PROTON)
+                .collect::<Vec<_>>();
+            mz.sort_by(f32::total_cmp);
+            let intensity = (0..mz.len())
+                .map(|i| ((i * 37) % 101) as f32 + 1.0)
+                .collect::<Vec<_>>();
+            let charge = 2 + (k % 3) as u8;
+            let mass = full.peptides[target].monoisotopic + ((k % 4) as f32 - 1.0) * NEUTRON;
+            let precursor = |charge: u8, annotated: bool| Precursor {
+                mz: mass / charge as f32 + PROTON,
+                charge: annotated.then_some(charge),
+                isolation_window: Some(Tolerance::Da(-0.8, 0.8)),
+                ..Default::default()
+            };
+            let precursors = match k % 4 {
+                0 => vec![precursor(charge, false)],
+                1 => {
+                    let listed = precursor(charge, true);
+                    vec![
+                        listed.clone(),
+                        Precursor {
+                            charge: Some(charge + 1),
+                            ..listed
+                        },
+                    ]
+                }
+                _ => vec![precursor(charge, true)],
+            };
+            let raw = RawSpectrum {
+                ms_level: 2,
+                representation: Representation::Centroid,
+                precursors,
+                intensity,
+                mz,
+                ..Default::default()
+            };
+            spectra.push(SpectrumProcessor::new(150, false, 0.0).process(raw));
+        }
+
+        let settings = [
+            // precursor tol, fragment tol, isotope errors, wide window, chimera,
+            // override precursor charge, report_psms, max fragment charge
+            (
+                Tolerance::Ppm(-10.0, 10.0),
+                Tolerance::Ppm(-20.0, 20.0),
+                (-1, 2),
+                false,
+                false,
+                false,
+                5,
+                Some(1),
+            ),
+            (
+                Tolerance::Ppm(-20.0, 20.0),
+                Tolerance::Da(-0.5, 0.5),
+                (0, 0),
+                false,
+                false,
+                false,
+                10,
+                None,
+            ),
+            (
+                Tolerance::Da(-1.5, 1.5),
+                Tolerance::Ppm(-20.0, 20.0),
+                (-1, 3),
+                false,
+                true,
+                false,
+                3,
+                Some(2),
+            ),
+            (
+                Tolerance::Ppm(-50.0, 20.0),
+                Tolerance::Ppm(-10.0, 10.0),
+                (0, 2),
+                false,
+                false,
+                true,
+                5,
+                Some(1),
+            ),
+            (
+                Tolerance::Ppm(-10.0, 10.0),
+                Tolerance::Ppm(-20.0, 20.0),
+                (0, 1),
+                true,
+                false,
+                false,
+                5,
+                Some(1),
+            ),
+            // open search
+            (
+                Tolerance::Da(-100.0, 50.0),
+                Tolerance::Ppm(-20.0, 20.0),
+                (0, 0),
+                false,
+                false,
+                false,
+                5,
+                Some(1),
+            ),
+        ];
+        for (case, &(precursor_tol, fragment_tol, isotopes, wide, chimera, overr, psms, frag)) in
+            settings.iter().enumerate()
+        {
+            let scorer = |db| Scorer {
+                db,
+                precursor_tol,
+                fragment_tol,
+                min_matched_peaks: 2,
+                min_isotope_err: isotopes.0,
+                max_isotope_err: isotopes.1,
+                min_precursor_charge: 2,
+                max_precursor_charge: 4,
+                override_precursor_charge: overr,
+                max_fragment_charge: frag,
+                chimera,
+                report_psms: psms,
+                wide_window: wide,
+                annotate_matches: true,
+                score_type: ScoreType::SageHyperScore,
+            };
+            let probe = IndexedDatabase {
+                peptides: peptides.clone(),
+                ..Default::default()
+            };
+            let reachable = scorer(&probe).reachable_peptides(&spectra);
+            assert_eq!(reachable.len(), n);
+            let pruned = params.clone().build_reachable(peptides.clone(), &reachable);
+            assert_eq!(pruned.peptides.len(), n);
+            assert_eq!(
+                pruned.fragments.len(),
+                full.fragments
+                    .iter()
+                    .filter(|f| reachable[f.peptide_index.0 as usize])
+                    .count()
+            );
+            if case == 0 {
+                assert!(
+                    pruned.fragments.len() < full.fragments.len() / 2,
+                    "narrow windows must prune"
+                );
+            }
+
+            let psms = |db| {
+                let mut psms = spectra
+                    .iter()
+                    .flat_map(|query| scorer(db).score(query))
+                    .collect::<Vec<_>>();
+                // `psm_id` comes from a global counter
+                psms.iter_mut().for_each(|psm| psm.psm_id = 0);
+                psms
+            };
+            let expected = psms(&full);
+            assert!(!expected.is_empty(), "case {case}: no PSMs");
+            assert_eq!(
+                serde_json::to_string(&psms(&pruned)).unwrap(),
+                serde_json::to_string(&expected).unwrap(),
+                "case {case}"
+            );
         }
     }
 

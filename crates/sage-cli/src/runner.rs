@@ -67,12 +67,47 @@ impl Runner {
                 };
                 let paths = &parameters.mzml_paths;
                 let batch = &paths[..parallel.min(paths.len())];
-                let (database, spectra) = rayon::join(
-                    || parameters.database.clone().build(fasta),
-                    || reader.read_processed_spectra(batch, 0, parallel),
-                );
-                first_batch = Some(spectra?);
-                database
+                if batch.len() == paths.len() {
+                    // Every spectrum that will be searched is in this batch: digest while
+                    // it is read, then index only the fragments of the peptides that one
+                    // of its precursor windows can reach. The peptide list (and so every
+                    // peptide index) stays complete and the results are identical; the
+                    // other peptides' fragments could never be counted (typically a third
+                    // to two thirds of all fragments).
+                    let db_params = parameters.database.clone();
+                    let (peptides, spectra) = rayon::join(
+                        || db_params.digest(&fasta),
+                        || reader.read_processed_spectra(batch, 0, parallel),
+                    );
+                    drop(fasta);
+                    let spectra = spectra?;
+                    let mut probe = IndexedDatabase {
+                        peptides,
+                        ..Default::default()
+                    };
+                    let reachable = reader.scorer(&probe).reachable_peptides(
+                        spectra.1.par_iter().filter(|spec| reader.searchable(spec)),
+                    );
+                    let peptides = std::mem::take(&mut probe.peptides);
+                    info!(
+                        "indexing the fragments of {} of {} peptides (reachable from a precursor window)",
+                        reachable.iter().filter(|&&r| r).count(),
+                        peptides.len(),
+                    );
+                    first_batch = Some(spectra);
+                    parameters
+                        .database
+                        .clone()
+                        .build_reachable(peptides, &reachable)
+                } else {
+                    // Later batches are read after the index is built: index everything
+                    let (database, spectra) = rayon::join(
+                        || parameters.database.clone().build(fasta),
+                        || reader.read_processed_spectra(batch, 0, parallel),
+                    );
+                    first_batch = Some(spectra?);
+                    database
+                }
             }
             true => {
                 parameters
@@ -148,21 +183,8 @@ impl Runner {
             );
 
             let scorer = Scorer {
-                db: &db,
-                precursor_tol: self.parameters.precursor_tol,
-                fragment_tol: self.parameters.fragment_tol,
-                min_matched_peaks: self.parameters.min_matched_peaks,
-                min_isotope_err: self.parameters.isotope_errors.0,
-                max_isotope_err: self.parameters.isotope_errors.1,
-                min_precursor_charge: self.parameters.precursor_charge.0,
-                max_precursor_charge: self.parameters.precursor_charge.1,
-                override_precursor_charge: self.parameters.override_precursor_charge,
-                max_fragment_charge: self.parameters.max_fragment_charge,
-                chimera: self.parameters.chimera,
                 report_psms: self.parameters.report_psms + 1, // Q: Why is 1 being added here? (JSPP: Feb 2024)
-                wide_window: self.parameters.wide_window,
-                annotate_matches: self.parameters.annotate_matches,
-                score_type: self.parameters.score_type,
+                ..self.scorer(&db)
             };
 
             // Allocate an array of booleans indicating whether a peptide was identified in a
@@ -478,9 +500,10 @@ impl Runner {
         Ok(results.into_iter().collect::<SageResults>())
     }
 
-    pub fn run(mut self, parallel: usize, parquet: bool) -> anyhow::Result<telemetry::Telemetry> {
-        let scorer = Scorer {
-            db: &self.database,
+    /// The search's scorer over `db` (also used to decide which peptides to index)
+    fn scorer<'db>(&self, db: &'db IndexedDatabase) -> Scorer<'db> {
+        Scorer {
+            db,
             precursor_tol: self.parameters.precursor_tol,
             fragment_tol: self.parameters.fragment_tol,
             min_matched_peaks: self.parameters.min_matched_peaks,
@@ -495,7 +518,11 @@ impl Runner {
             wide_window: self.parameters.wide_window,
             annotate_matches: self.parameters.annotate_matches,
             score_type: self.parameters.score_type,
-        };
+        }
+    }
+
+    pub fn run(mut self, parallel: usize, parquet: bool) -> anyhow::Result<telemetry::Telemetry> {
+        let scorer = self.scorer(&self.database);
 
         //Collect all results into a single container
         let first_batch = self.first_batch.take();

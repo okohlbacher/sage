@@ -343,9 +343,13 @@ impl Parameters {
 
     /// All theoretical fragments of `peptides`, in [`binned_fragments`] order: by m/z
     /// ([`f32::total_cmp`]), fragments of equal m/z by peptide index.
-    fn sorted_fragments(&self, peptides: &[Peptide]) -> Vec<Theoretical> {
+    ///
+    /// With `indexed`, only the peptides marked `true` contribute fragments; every
+    /// fragment still carries the peptide's index into the complete `peptides`.
+    fn sorted_fragments(&self, peptides: &[Peptide], indexed: Option<&[bool]>) -> Vec<Theoretical> {
         self.sorted_fragments_with(
             peptides,
+            indexed,
             4096,
             MAX_BINS,
             (rayon::current_num_threads() * 4).clamp(1, 256),
@@ -355,10 +359,15 @@ impl Parameters {
     fn sorted_fragments_with(
         &self,
         peptides: &[Peptide],
+        indexed: Option<&[bool]>,
         chunk_size: usize,
         max_bins: usize,
         max_groups: usize,
     ) -> Vec<Theoretical> {
+        if let Some(indexed) = indexed {
+            assert_eq!(indexed.len(), peptides.len(), "one flag per peptide");
+        }
+        let is_indexed = |ix: usize| indexed.map_or(true, |indexed| indexed[ix]);
         // The fragments of a peptide are lighter than the peptide plus the terminal group
         // of an a/c/x/z ion, so practically every fragment falls into a regular bin of
         // [GUESS_LOW, heaviest peptide + GUESS_MARGIN] without a separate pass over all
@@ -370,10 +379,21 @@ impl Parameters {
             .reduce(|| f32::NEG_INFINITY, f32::max);
         binned_fragments(
             peptides.len(),
-            |ix| peptides[ix].sequence.len(),
             |ix| {
-                self.index_ions(&peptides[ix])
-                    .map(|ion| ion.monoisotopic_mass)
+                if is_indexed(ix) {
+                    peptides[ix].sequence.len()
+                } else {
+                    0
+                }
+            },
+            |ix| {
+                is_indexed(ix)
+                    .then(|| {
+                        self.index_ions(&peptides[ix])
+                            .map(|ion| ion.monoisotopic_mass)
+                    })
+                    .into_iter()
+                    .flatten()
             },
             MzBins::new(GUESS_LOW, heaviest + GUESS_MARGIN, max_bins),
             chunk_size,
@@ -383,6 +403,24 @@ impl Parameters {
     }
 
     pub fn build_from_peptides(self, target_decoys: Vec<Peptide>) -> IndexedDatabase {
+        self.build_index(target_decoys, None)
+    }
+
+    /// Like [`Self::build_from_peptides`], but only the fragments of the peptides marked
+    /// in `reachable` (one flag per peptide) go into the fragment index. The peptide
+    /// list stays complete, so every peptide keeps its index. A search gives the same
+    /// results as with the full index as long as every peptide that one of its
+    /// precursor windows can reach is marked (see
+    /// [`crate::scoring::Scorer::reachable_peptides`]).
+    pub fn build_reachable(
+        self,
+        target_decoys: Vec<Peptide>,
+        reachable: &[bool],
+    ) -> IndexedDatabase {
+        self.build_index(target_decoys, Some(reachable))
+    }
+
+    fn build_index(self, target_decoys: Vec<Peptide>, indexed: Option<&[bool]>) -> IndexedDatabase {
         log::trace!("generating fragments");
 
         // Finally, perform in silico digest for our target sequences
@@ -390,7 +428,7 @@ impl Parameters {
         // [`SpectrumProcessor`] or during scoring - all theoretical
         // fragments are monoisotopic/uncharged
         // All of our theoretical fragments, sorted by m/z from low to high
-        let mut fragments = self.sorted_fragments(&target_decoys);
+        let mut fragments = self.sorted_fragments(&target_decoys, indexed);
         log::trace!("finalizing index");
 
         // Now, we bucket all of our theoretical fragments, and within each bucket
@@ -1421,22 +1459,48 @@ mod test {
         for max_bins in [2, 3, 64, 1000, MAX_BINS] {
             for chunk_size in [1, 7, 4096] {
                 for max_groups in [1, 3, 256] {
-                    let got =
-                        params.sorted_fragments_with(&peptides, chunk_size, max_bins, max_groups);
+                    let got = params
+                        .sorted_fragments_with(&peptides, None, chunk_size, max_bins, max_groups);
                     assert_eq!(bits(&got), expected, "{max_bins} {chunk_size} {max_groups}");
                 }
             }
         }
+
+        // only marked peptides contribute, under their index in the complete list
+        let indexed = (0..peptides.len())
+            .map(|ix| ix % 3 != 1)
+            .collect::<Vec<_>>();
+        let marked = expected
+            .iter()
+            .copied()
+            .filter(|f| indexed[f.0 as usize])
+            .collect::<Vec<_>>();
+        for chunk_size in [1, 7, 4096] {
+            for max_groups in [1, 3, 256] {
+                let got = params.sorted_fragments_with(
+                    &peptides,
+                    Some(&indexed),
+                    chunk_size,
+                    MAX_BINS,
+                    max_groups,
+                );
+                assert_eq!(bits(&got), marked, "{chunk_size} {max_groups}");
+            }
+        }
+        let none = vec![false; peptides.len()];
+        assert!(params
+            .sorted_fragments_with(&peptides, Some(&none), 7, MAX_BINS, 3)
+            .is_empty());
         // the default grouping depends on the thread count, the result must not
         for threads in [1, 2, 7] {
             let pool = rayon::ThreadPoolBuilder::new()
                 .num_threads(threads)
                 .build()
                 .unwrap();
-            let got = pool.install(|| params.sorted_fragments(&peptides));
+            let got = pool.install(|| params.sorted_fragments(&peptides, None));
             assert_eq!(bits(&got), expected, "{threads} threads");
         }
-        assert!(params.sorted_fragments(&[]).is_empty());
+        assert!(params.sorted_fragments(&[], None).is_empty());
 
         // fragments outside the guessed range (a1 ions below GUESS_LOW; masses above a
         // peptide mass that is too low) are sorted in the overflow bins
@@ -1448,14 +1512,14 @@ mod test {
         )));
         assert!(f32::from_bits(expected[0].1) < GUESS_LOW);
         for max_bins in [2, 64, MAX_BINS] {
-            let got = wide.sorted_fragments_with(&peptides, 7, max_bins, 5);
+            let got = wide.sorted_fragments_with(&peptides, None, 7, max_bins, 5);
             assert_eq!(bits(&got), expected);
         }
         let mut light = peptides.clone();
         light.iter_mut().for_each(|p| p.monoisotopic = 100.0);
         let expected = bits(&stable_mz_sort(fragments_in_peptide_order(&params, &light)));
         assert_eq!(
-            bits(&params.sorted_fragments_with(&light, 7, MAX_BINS, 5)),
+            bits(&params.sorted_fragments_with(&light, None, 7, MAX_BINS, 5)),
             expected
         );
     }
