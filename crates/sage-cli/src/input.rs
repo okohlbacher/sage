@@ -101,7 +101,11 @@ impl MaxPeaks {
     /// Peaks kept per MS2 spectrum by `"auto"` for low-resolution fragment spectra
     /// (e.g. ion trap CID searched at 0.5 Da)
     pub const AUTO_LOW_RES: usize = 80;
-    /// A Da fragment tolerance at least this wide (on either side) means low resolution
+    /// Peaks kept per MS2 spectrum by `"auto"` for low-resolution fragment spectra when TMT
+    /// reporter ions are quantified from the MS2 spectra (`quant.tmt_settings.level` 2): the
+    /// former fixed default, because 80 peaks drop reporter ions
+    pub const AUTO_LOW_RES_TMT_MS2: usize = 150;
+    /// A Da fragment tolerance reaching this value (on at least one side) means low resolution
     pub const LOW_RES_DA: f32 = 0.1;
 
     /// Does `"auto"` treat this fragment tolerance as low resolution? Only Da tolerances
@@ -114,14 +118,16 @@ impl MaxPeaks {
     }
 
     /// The number of peaks to keep per MS2 spectrum: an explicit count as given; `"auto"`
-    /// gives [`MaxPeaks::AUTO_LOW_RES`] for a Da fragment tolerance of at least
-    /// ±[`MaxPeaks::LOW_RES_DA`] and [`MaxPeaks::AUTO_HIGH_RES`] otherwise (ppm, pct, or a
-    /// narrow Da tolerance such as ±0.02 Da)
-    pub fn resolve(self, fragment_tol: &Tolerance) -> usize {
+    /// gives [`MaxPeaks::AUTO_HIGH_RES`] for a ppm or pct fragment tolerance or a narrow Da
+    /// tolerance (such as ±0.02 Da); for a Da tolerance reaching [`MaxPeaks::LOW_RES_DA`] it
+    /// gives [`MaxPeaks::AUTO_LOW_RES`], or [`MaxPeaks::AUTO_LOW_RES_TMT_MS2`] if `tmt_ms2`
+    /// (TMT reporter ions are quantified from the MS2 spectra)
+    pub fn resolve(self, fragment_tol: &Tolerance, tmt_ms2: bool) -> usize {
         match self {
             MaxPeaks::Count(n) => n,
-            MaxPeaks::Auto if Self::low_resolution(fragment_tol) => Self::AUTO_LOW_RES,
-            MaxPeaks::Auto => Self::AUTO_HIGH_RES,
+            MaxPeaks::Auto if !Self::low_resolution(fragment_tol) => Self::AUTO_HIGH_RES,
+            MaxPeaks::Auto if tmt_ms2 => Self::AUTO_LOW_RES_TMT_MS2,
+            MaxPeaks::Auto => Self::AUTO_LOW_RES,
         }
     }
 }
@@ -443,16 +449,22 @@ impl Input {
 
         let score_type = self.score_type.unwrap_or(ScoreType::SageHyperScore);
 
+        let quant: QuantSettings = self.quant.map(Into::into).unwrap_or_default();
+        // TMT reporter ions quantified from the MS2 spectra must survive the peak cap
+        let tmt_ms2 = quant.tmt.is_some() && quant.tmt_settings.level == 2;
         let max_peaks = self.max_peaks.unwrap_or_default();
-        let max_peaks_resolved = max_peaks.resolve(&self.fragment_tol);
+        let max_peaks_resolved = max_peaks.resolve(&self.fragment_tol, tmt_ms2);
         if max_peaks == MaxPeaks::Auto {
+            let low_resolution = MaxPeaks::low_resolution(&self.fragment_tol);
             log::info!(
-                "max_peaks: auto -> {} peaks per MS2 spectrum ({:?} fragment tolerance: {} resolution)",
+                "max_peaks: auto -> {} peaks per MS2 spectrum ({:?} fragment tolerance: {} resolution{})",
                 max_peaks_resolved,
                 self.fragment_tol,
-                match MaxPeaks::low_resolution(&self.fragment_tol) {
-                    true => "low",
-                    false => "high",
+                if low_resolution { "low" } else { "high" },
+                if low_resolution && tmt_ms2 {
+                    ", TMT reporter ions quantified from MS2"
+                } else {
+                    ""
                 },
             );
         }
@@ -460,7 +472,7 @@ impl Input {
         Ok(Search {
             version: clap::crate_version!().into(),
             database,
-            quant: self.quant.map(Into::into).unwrap_or_default(),
+            quant,
             mzml_paths,
             output_directory,
             precursor_tol: self.precursor_tol,
@@ -501,6 +513,15 @@ mod test {
         fragment_tol: serde_json::Value,
         max_peaks: Option<serde_json::Value>,
     ) -> anyhow::Result<usize> {
+        resolved_max_peaks_quant(fragment_tol, max_peaks, None)
+    }
+
+    /// As [`resolved_max_peaks`], with a `quant` section
+    fn resolved_max_peaks_quant(
+        fragment_tol: serde_json::Value,
+        max_peaks: Option<serde_json::Value>,
+        quant: Option<serde_json::Value>,
+    ) -> anyhow::Result<usize> {
         let mut config = serde_json::json!({
             "database": { "fasta": "proteins.fasta" },
             "precursor_tol": { "ppm": [-10.0, 10.0] },
@@ -510,6 +531,9 @@ mod test {
         });
         if let Some(max_peaks) = max_peaks {
             config["max_peaks"] = max_peaks;
+        }
+        if let Some(quant) = quant {
+            config["quant"] = quant;
         }
         let input: Input = serde_json::from_value(config)?;
         Ok(input.build()?.max_peaks)
@@ -540,7 +564,7 @@ mod test {
         }
 
         assert_eq!(MaxPeaks::default(), MaxPeaks::Auto);
-        let auto = |tol: Tolerance| MaxPeaks::Auto.resolve(&tol);
+        let auto = |tol: Tolerance| MaxPeaks::Auto.resolve(&tol, false);
         assert_eq!(auto(Tolerance::Ppm(-5.0, 5.0)), MaxPeaks::AUTO_HIGH_RES);
         assert_eq!(auto(Tolerance::Ppm(-500.0, 500.0)), MaxPeaks::AUTO_HIGH_RES);
         assert_eq!(auto(Tolerance::Da(-0.05, 0.05)), MaxPeaks::AUTO_HIGH_RES);
@@ -550,7 +574,45 @@ mod test {
         assert_eq!(auto(Tolerance::Da(-1.0005, 1.0005)), MaxPeaks::AUTO_LOW_RES);
         assert_eq!(auto(Tolerance::Da(-0.5, 0.0)), MaxPeaks::AUTO_LOW_RES);
         assert_eq!(auto(Tolerance::Da(-0.01, 0.4)), MaxPeaks::AUTO_LOW_RES);
-        assert_eq!(MaxPeaks::Count(42).resolve(&Tolerance::Da(-0.5, 0.5)), 42);
+        assert_eq!(
+            MaxPeaks::Count(42).resolve(&Tolerance::Da(-0.5, 0.5), false),
+            42
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn max_peaks_auto_keeps_tmt_reporters_of_ms2() -> anyhow::Result<()> {
+        use serde_json::json;
+        let ppm = json!({ "ppm": [-20.0, 20.0] });
+        let da = json!({ "da": [-0.5, 0.5] });
+        let narrow_da = json!({ "da": [-0.02, 0.02] });
+        let tmt_ms2 = json!({ "tmt": "Tmt16", "tmt_settings": { "level": 2 } });
+        let tmt_ms3 = json!({ "tmt": "Tmt16", "tmt_settings": { "level": 3 } });
+        let tmt_default = json!({ "tmt": "Tmt16" }); // level 3
+        let lfq = json!({ "lfq": true });
+        let auto = |tol: &serde_json::Value, quant: &serde_json::Value| {
+            resolved_max_peaks_quant(tol.clone(), None, Some(quant.clone()))
+        };
+
+        // low resolution with reporter ions read from MS2: the former default
+        assert_eq!(auto(&da, &tmt_ms2)?, MaxPeaks::AUTO_LOW_RES_TMT_MS2);
+        // reporter ions from MS3 (not capped), or no TMT: unchanged
+        assert_eq!(auto(&da, &tmt_ms3)?, MaxPeaks::AUTO_LOW_RES);
+        assert_eq!(auto(&da, &tmt_default)?, MaxPeaks::AUTO_LOW_RES);
+        assert_eq!(auto(&da, &lfq)?, MaxPeaks::AUTO_LOW_RES);
+        // high resolution keeps more peaks than the former default anyway
+        assert_eq!(auto(&ppm, &tmt_ms2)?, MaxPeaks::AUTO_HIGH_RES);
+        assert_eq!(auto(&narrow_da, &tmt_ms2)?, MaxPeaks::AUTO_HIGH_RES);
+        // an explicit number is used as given
+        assert_eq!(
+            resolved_max_peaks_quant(da.clone(), Some(json!(60)), Some(tmt_ms2.clone()))?,
+            60
+        );
+        assert_eq!(
+            MaxPeaks::Auto.resolve(&Tolerance::Da(-0.5, 0.5), true),
+            MaxPeaks::AUTO_LOW_RES_TMT_MS2
+        );
         Ok(())
     }
 
