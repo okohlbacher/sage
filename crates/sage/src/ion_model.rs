@@ -35,6 +35,7 @@ use crate::mass::{monoisotopic, Tolerance};
 use crate::scoring::Feature;
 use crate::spectrum::ProcessedSpectrum;
 use rayon::prelude::*;
+use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, HashMap};
 
 /// Ion series: b, y
@@ -528,18 +529,33 @@ pub fn annotate(
     tolerance: Tolerance,
     min_training_psms: usize,
 ) -> Vec<IonModelSummary> {
-    // spectrum of each feature (the first spectrum of a file with that id)
-    let mut by_id = HashMap::with_capacity(spectra.len());
+    // spectrum of each feature, found by its file and native id. An id that more than one
+    // spectrum of a file carries (e.g. repeated MGF titles) cannot tell which of them a PSM
+    // came from: such PSMs are left out (features 0, not used for training), whatever the
+    // order of the spectra.
+    let mut by_id: HashMap<(usize, &str), Option<usize>> = HashMap::with_capacity(spectra.len());
+    let mut ambiguous = 0usize;
     for (ix, spectrum) in spectra.iter().enumerate() {
-        if spectrum.ion_evidence.is_some() {
-            by_id
-                .entry((spectrum.file_id, spectrum.id.as_str()))
-                .or_insert(ix);
+        match by_id.entry((spectrum.file_id, spectrum.id.as_str())) {
+            Entry::Vacant(entry) => {
+                entry.insert(spectrum.ion_evidence.is_some().then_some(ix));
+            }
+            Entry::Occupied(mut entry) => {
+                entry.insert(None);
+                ambiguous += 1;
+            }
         }
+    }
+    if ambiguous > 0 {
+        log::warn!(
+            "ion model: {} spectra repeat the native id of another spectrum of their file; \
+             the PSMs of those ids get no ion features",
+            ambiguous
+        );
     }
     let mut files: BTreeMap<usize, Vec<(usize, usize)>> = BTreeMap::new();
     for (ix, feature) in features.iter().enumerate() {
-        if let Some(&spectrum) = by_id.get(&(feature.file_id, feature.spec_id.as_str())) {
+        if let Some(&Some(spectrum)) = by_id.get(&(feature.file_id, feature.spec_id.as_str())) {
             files
                 .entry(feature.file_id)
                 .or_default()
@@ -1037,5 +1053,56 @@ mod test {
             }
         }
         assert!(fold1_changed > 0);
+    }
+
+    #[test]
+    fn psms_of_repeated_native_ids_get_no_ion_features() {
+        let (db, mut spectra, mut features) = small_search();
+        let tol = Tolerance::Ppm(-10.0, 10.0);
+        // two spectra of file 0 with PSMs get the same native id (e.g. repeated MGF titles)
+        let ids = spectra
+            .iter()
+            .filter(|s| {
+                s.file_id == 0 && features.iter().any(|f| f.file_id == 0 && f.spec_id == s.id)
+            })
+            .map(|s| s.id.clone())
+            .take(2)
+            .collect::<Vec<_>>();
+        let (a, b) = (ids[0].clone(), ids[1].clone());
+        for s in spectra.iter_mut().filter(|s| s.file_id == 0 && s.id == b) {
+            s.id = a.clone();
+        }
+        for f in features
+            .iter_mut()
+            .filter(|f| f.file_id == 0 && f.spec_id == b)
+        {
+            f.spec_id = a.clone();
+        }
+        let repeated = |f: &Feature| f.file_id == 0 && f.spec_id == a;
+        let mut annotated = features.clone();
+        let summaries = annotate(&mut annotated, &spectra, &db, tol, 10);
+        assert!(summaries.iter().all(|s| s.trained), "{summaries:?}");
+        assert!(annotated.iter().filter(|f| repeated(f)).count() >= 2);
+        assert!(annotated
+            .iter()
+            .filter(|f| repeated(f))
+            .all(|f| f.ion_llr == 0.0 && f.ion_explained == 0.0));
+        assert!(annotated.iter().any(|f| !repeated(f) && f.ion_llr != 0.0));
+
+        // the same whichever of the two spectra comes first
+        let at = spectra
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.file_id == 0 && s.id == a)
+            .map(|(ix, _)| ix)
+            .collect::<Vec<_>>();
+        assert_eq!(at.len(), 2);
+        spectra.swap(at[0], at[1]);
+        let mut swapped = features.clone();
+        annotate(&mut swapped, &spectra, &db, tol, 10);
+        for (x, y) in annotated.iter().zip(&swapped) {
+            assert_eq!(x.ion_llr.to_bits(), y.ion_llr.to_bits());
+            assert_eq!(x.ion_explained.to_bits(), y.ion_explained.to_bits());
+        }
     }
 }

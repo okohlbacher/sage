@@ -158,7 +158,8 @@ pub struct Feature {
     pub fragments: Option<Fragments>,
 
     /// HyperScore on intensities normalised to the most intense peak of the spectrum
-    /// (label-free score that selects the fragment-ion model's training PSMs)
+    /// (label-free score that selects the fragment-ion model's training PSMs; 0 unless
+    /// the spectrum kept its peak lists for the model)
     #[serde(skip_serializing)]
     pub normalized_hyperscore: f64,
     /// Fragment-ion model: log-likelihood ratio of the fragment evidence, signal vs noise
@@ -782,7 +783,13 @@ impl<'db> Scorer<'db> {
         // Sage operates on masses without protons; [M] instead of [MH+]
         let mz = precursor.mz - PROTON;
 
-        let max_intensity = query.intensities.iter().copied().fold(0.0f32, f32::max);
+        // only the fragment-ion model (`ion_model`) uses the normalised HyperScore, and only
+        // for spectra that kept their peak lists for it
+        let max_intensity = query
+            .ion_evidence
+            .is_some()
+            .then(|| query.intensities.iter().copied().fold(0.0f32, f32::max))
+            .unwrap_or(0.0);
 
         for idx in 0..report_psms.min(score_vector.len()) {
             let score = score_vector[idx].0;
