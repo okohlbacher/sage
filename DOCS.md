@@ -444,9 +444,15 @@ Note on the settings below:
   wide Da tolerance, low-intensity peaks mostly add chance matches. On the 20 public files of the OpenMS benchmark
   (OpenMS#10364, Percolator, 1% FDR) `"auto"` finds 2.3% more PSMs than the former fixed default of 150
   (Astral +10.8%), at a lower doubled-database entrapment FDP (1.08% -> 1.03%), and Sage's own q-values find 2.2% more.
-  Searches of high-resolution data take up to 9% longer (more peaks to score), 0.5 Da searches up to 10% less.
+  `"auto"` goes by the unit of `fragment_tol` only: it assumes that a Da tolerance of 0.1 Da or more means
+  low-resolution fragment spectra and that a ppm or pct tolerance means high-resolution ones; for other cases (e.g.
+  low-resolution data searched with a ppm tolerance) set a number. Time: scoring more peaks makes the search phase
+  about 35-80% longer on high-resolution data (Astral, timsTOF, Exploris; 0.5 Da searches score fewer peaks and get
+  faster). On the 8,000-spectrum benchmark files at 4 threads, where building the index takes most of the run, the
+  total stayed about the same (high-resolution files 0-7% longer); one complete Astral run (122,659 MS2 spectra) took
+  13% longer at 4 threads and 5.5% at 16, with 0.3-0.65 GiB more peak memory (measured on a loaded node, indicative).
   The resolved number is logged and written to `results.json`; an explicit number is used as given
-  (`max_peaks: 150` reproduces the results of earlier versions).
+  (`max_peaks: 150` reproduces the results and the speed of earlier versions).
 - **min_matched_peaks**: Integer. The minimum number of matched b+y ions to use for reporting PSMs (default: 4).
 - **max_fragment_charge**: Integer. The maximum fragment ion charge states to consider (default: null - use precursor z-1).
 - **report_psms**: Integer. The number of PSMs to report for each spectrum. Higher values might disrupt LDA (default: 1).
