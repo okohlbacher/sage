@@ -50,27 +50,24 @@ pub fn group_digests(mut digests: Vec<Digest>) -> Vec<DigestGroup> {
             .then(a.missed_cleavages.cmp(&b.missed_cleavages))
             .then(a.protein.cmp(&b.protein))
     });
-    let mut curr_group = DigestGroup {
-        reference: digests[0].clone(),
-        proteins: Vec::new(),
-    };
-    for digest in digests {
-        if digest.decoy == curr_group.reference.decoy
-            && digest.position == curr_group.reference.position
-            && digest.sequence == curr_group.reference.sequence
-        {
-            curr_group.proteins.push(digest.protein);
-        } else {
-            curr_group.proteins.sort_unstable();
-            groups.push(curr_group);
-            curr_group = DigestGroup {
-                reference: digest.clone(),
-                proteins: vec![digest.protein],
-            };
-        }
-    }
-    curr_group.proteins.sort_unstable();
-    groups.push(curr_group);
+    // Groups are runs of equal (position, decoy, sequence) in sorted order; build them in
+    // parallel (the serial loop took ~1.2 s for human tryptic). The reference is the
+    // first digest of each run, and the proteins are all of the run's proteins, sorted.
+    groups = digests
+        .par_chunk_by(|a, b| {
+            a.decoy == b.decoy && a.position == b.position && a.sequence == b.sequence
+        })
+        .map(|run| {
+            let mut proteins = run.iter().map(|d| d.protein.clone()).collect::<Vec<_>>();
+            proteins.sort_unstable();
+            DigestGroup {
+                reference: run[0].clone(),
+                proteins,
+            }
+        })
+        .collect();
+    // freeing ~10^7 strings one by one is slow too
+    digests.into_par_iter().for_each(drop);
     groups
 }
 
@@ -376,6 +373,71 @@ mod test {
             let _ = trypsin.cleavage_sites(seq);
         }
         assert!(group_digests(Vec::new()).is_empty());
+    }
+
+    #[test]
+    fn parallel_grouping_matches_sequential_grouping() {
+        let fasta = crate::fasta::Fasta::parse(
+            concat!(
+                include_str!("../../../tests/Q99536.fasta"),
+                ">P2\nMSDEREVAEAATGEDASSPPPKTEAASDPQHPAASEGAAAAAASPPLLR\n"
+            )
+            .into(),
+            "rev_",
+            true,
+        );
+        let enzyme = EnzymeParameters {
+            missed_cleavages: 2,
+            min_len: 5,
+            max_len: 50,
+            enzyme: Enzyme::new("KR", "P", true, true),
+        };
+        let digests = fasta.digest(&enzyme);
+        assert!(digests.len() > 100);
+        // reference: the previous sequential grouping over the same sorted order
+        let mut sorted = digests.clone();
+        sorted.sort_unstable_by(|a, b| {
+            a.position
+                .cmp(&b.position)
+                .then(a.decoy.cmp(&b.decoy))
+                .then(a.sequence.cmp(&b.sequence))
+                .then(a.semi_enzymatic.cmp(&b.semi_enzymatic))
+                .then(a.missed_cleavages.cmp(&b.missed_cleavages))
+                .then(a.protein.cmp(&b.protein))
+        });
+        // (group key, reference flags, proteins) in sorted order
+        let mut expected: Vec<(String, bool, u8, Vec<String>)> = Vec::new();
+        let mut last_key = None;
+        for d in &sorted {
+            let key = (d.position, d.decoy, d.sequence.clone());
+            if last_key.as_ref() == Some(&key) {
+                expected.last_mut().unwrap().3.push(d.protein.to_string());
+            } else {
+                expected.push((
+                    d.sequence.clone(),
+                    d.semi_enzymatic,
+                    d.missed_cleavages,
+                    vec![d.protein.to_string()],
+                ));
+                last_key = Some(key);
+            }
+        }
+        let got = group_digests(digests)
+            .into_iter()
+            .map(|g| {
+                (
+                    g.reference.sequence,
+                    g.reference.semi_enzymatic,
+                    g.reference.missed_cleavages,
+                    g.proteins.iter().map(|p| p.to_string()).collect::<Vec<_>>(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(got.len(), expected.len());
+        for (g, mut e) in got.into_iter().zip(expected) {
+            e.3.sort();
+            assert_eq!(g, e);
+        }
     }
 
     #[test]
