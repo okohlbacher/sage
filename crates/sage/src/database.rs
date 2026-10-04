@@ -431,16 +431,18 @@ impl Parameters {
         // keep their m/z order, so the index depends on the fragments alone (see
         // [`binned_fragments`]).
         let peptide_bits = index_bits(target_decoys.len());
+        let pool = ScratchPool::new(self.bucket_size, 1 << page_digit_bits(peptide_bits));
         let min_value = fragments
             .par_chunks_mut(self.bucket_size)
-            .map_init(SortScratch::default, |scratch, chunk| {
+            .map(|chunk| {
                 // There should always be at least one item in the chunk!
                 //  we know the chunk is already sorted by fragment_mz too, so this is minimum value
                 let min = chunk[0].fragment_mz;
-                sort_by_peptide(chunk, peptide_bits, scratch);
+                pool.with(|scratch| sort_by_peptide(chunk, peptide_bits, scratch));
                 min
             })
             .collect::<Vec<_>>();
+        drop(pool);
 
         let potential_mods = self
             .variable_mods
@@ -565,6 +567,41 @@ struct SortScratch {
     counts: Vec<u32>,
 }
 
+impl SortScratch {
+    /// Buffers for sorts of up to `items` fragments with up to `counts` counters, allocated
+    /// by the calling thread. The index build allocates all of its scratch up front on one
+    /// thread: buffers that rayon workers allocate and free stay committed in each worker's
+    /// allocator heap, which raised the peak RSS of the search after the build by 0.07-0.18
+    /// GiB at 128 threads (human tryptic benchmark database).
+    fn with_capacity(items: usize, counts: usize) -> Self {
+        SortScratch {
+            items: Vec::with_capacity(items),
+            counts: Vec::with_capacity(counts),
+        }
+    }
+}
+
+/// One [`SortScratch`] per rayon worker, allocated up front by the calling thread
+struct ScratchPool(Vec<std::sync::Mutex<SortScratch>>);
+
+impl ScratchPool {
+    fn new(items: usize, counts: usize) -> Self {
+        ScratchPool(
+            (0..rayon::current_num_threads().max(1))
+                .map(|_| std::sync::Mutex::new(SortScratch::with_capacity(items, counts)))
+                .collect(),
+        )
+    }
+
+    /// Runs `f` with the current worker's scratch (uncontended: one per worker; a caller
+    /// outside the pool shares the first one under its lock)
+    fn with<R>(&self, f: impl FnOnce(&mut SortScratch) -> R) -> R {
+        let slot = rayon::current_thread_index().unwrap_or(0) % self.0.len();
+        let mut scratch = self.0[slot].lock().unwrap_or_else(|e| e.into_inner());
+        f(&mut scratch)
+    }
+}
+
 /// The fragments of items (peptides) `0..n` in (m/z, item index) order: by m/z
 /// ([`f32::total_cmp`]), and fragments of equal m/z by item index. `ions(ix)` yields
 /// the fragment m/z of item `ix` and must yield the same values every time it is
@@ -594,9 +631,9 @@ struct SortScratch {
 /// lookup visits all pages whose m/z range meets its window and tests every fragment
 /// in them against the same bounds, and the minimum m/z of every page is the same).
 ///
-/// Memory: the final array (no second copy of the fragments), one count or write
-/// position per group and bin (freed before the bin sort), and the bin sort's buffers,
-/// at most 1/`scratch_share` of the final array (or one bin).
+/// Memory: the final array (no second copy of the fragments), two positions per group
+/// and bin (freed before the bin sort), and the bin sort's buffers, at most
+/// 1/`scratch_share` of the final array (or one bin), all allocated by the calling thread.
 fn binned_fragments<W, F, I>(
     n: usize,
     weight: W,
@@ -664,38 +701,43 @@ where
     // SAFETY: shared only for writes to disjoint, bounds-checked elements (see below)
     unsafe impl Sync for Out {}
     let out = &Out(fragments.as_mut_ptr());
-    let filled = groups.par_iter().enumerate().all(|(g, range)| {
-        // (next write position, end) of group g's range in every bin: the range ends
-        // where that of the next group in the same bin starts
-        let start = &table[g * nbins..(g + 1) * nbins];
-        let ends = table
-            .get((g + 1) * nbins..(g + 2) * nbins)
-            .unwrap_or(&bounds[1..]);
-        let mut slots: Vec<(usize, usize)> =
-            start.iter().copied().zip(ends.iter().copied()).collect();
-        for ix in range.clone() {
-            let peptide_index = PeptideIx(ix as u32);
-            for mz in ions(ix) {
-                let slot = &mut slots[bins.of(mz)];
-                assert!(slot.0 < slot.1, "fragment count changed between passes");
-                // SAFETY: `slot.0 < total` lies in group g's own range of this bin; the
-                // ranges of all groups and bins are disjoint and tile `0..total`, which
-                // is within the capacity
-                unsafe {
-                    out.0.add(slot.0).write(Theoretical {
-                        peptide_index,
-                        fragment_mz: mz,
-                    })
-                };
-                slot.0 += 1;
+    // next write position of every (group, bin), one row per group, allocated here (see
+    // [`SortScratch::with_capacity`]); group g's range in a bin ends where that of the
+    // next group starts, which `table` still holds
+    let mut cursors = table.clone();
+    let filled = cursors
+        .par_chunks_mut(nbins)
+        .zip(groups.par_iter())
+        .enumerate()
+        .all(|(g, (next, range))| {
+            let ends = table
+                .get((g + 1) * nbins..(g + 2) * nbins)
+                .unwrap_or(&bounds[1..]);
+            for ix in range.clone() {
+                let peptide_index = PeptideIx(ix as u32);
+                for mz in ions(ix) {
+                    let b = bins.of(mz);
+                    let at = next[b];
+                    assert!(at < ends[b], "fragment count changed between passes");
+                    // SAFETY: `at < total` lies in group g's own range of bin b; the
+                    // ranges of all groups and bins are disjoint and tile `0..total`,
+                    // which is within the capacity
+                    unsafe {
+                        out.0.add(at).write(Theoretical {
+                            peptide_index,
+                            fragment_mz: mz,
+                        })
+                    };
+                    next[b] = at + 1;
+                }
             }
-        }
-        slots.iter().all(|(next, end)| next == end)
-    });
+            next.iter().zip(ends).all(|(n, e)| n == e)
+        });
     assert!(filled, "fragment count changed between passes");
     // SAFETY: every range was filled completely (asserted above) and the ranges tile
     // `0..total`, so all `total` elements are initialised
     unsafe { fragments.set_len(total) };
+    drop(cursors);
     drop(table);
 
     // pass 3: order every bin (each arrived in item order). The counting sort of a bin
@@ -727,13 +769,20 @@ where
         runs.push(run);
     }
     debug_assert!(runs.len() <= sorters);
-    runs.into_par_iter().for_each(|run| {
-        let mut scratch = SortScratch::default();
-        for (b, bin) in run {
-            let low_bits = (!bins.is_overflow(b)).then_some(bins.shift);
-            sort_bin(bin, low_bits, &mut scratch);
-        }
-    });
+    // every sorter's buffers, allocated here (see [`SortScratch::with_capacity`]); only the
+    // counting sort of [`sort_bin`] uses them
+    let counts = if bins.shift <= 16 { 1 << bins.shift } else { 0 };
+    let scratch: Vec<SortScratch> = (0..runs.len())
+        .map(|_| SortScratch::with_capacity(largest, counts))
+        .collect();
+    runs.into_par_iter()
+        .zip(scratch)
+        .for_each(|(run, mut scratch)| {
+            for (b, bin) in run {
+                let low_bits = (!bins.is_overflow(b)).then_some(bins.shift);
+                sort_bin(bin, low_bits, &mut scratch);
+            }
+        });
     fragments
 }
 
@@ -818,6 +867,13 @@ fn index_bits(n: usize) -> u32 {
     usize::BITS - n.saturating_sub(1).leading_zeros()
 }
 
+/// Digit width of [`sort_by_peptide`] for indices below `2^bits`: the fewest passes of at
+/// most 12 bits, split evenly
+fn page_digit_bits(bits: u32) -> u32 {
+    let bits = bits.clamp(1, 32);
+    bits.div_ceil(bits.div_ceil(12))
+}
+
 /// Stable LSD radix sort of `page` by peptide index (all indices below `2^bits`), in at
 /// most 12-bit digits. A page holds `bucket_size` fragments in m/z order with random
 /// peptide indices; a comparison sort of each page cost ~20 ns per fragment.
@@ -829,8 +885,8 @@ fn sort_by_peptide(page: &mut [Theoretical], bits: u32, scratch: &mut SortScratc
         page.sort_by_key(|frag| frag.peptide_index);
         return;
     }
-    let passes = bits.min(32).div_ceil(12);
-    let width = bits.min(32).div_ceil(passes);
+    let width = page_digit_bits(bits);
+    let passes = bits.min(32).div_ceil(width);
     let mask = (1u32 << width) - 1;
     let counts = &mut scratch.counts;
     counts.clear();
