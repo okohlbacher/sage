@@ -448,6 +448,7 @@ Note on the settings below:
       "s3://my-mass-spec-data/PXD0000001/foo.mzML.gz"
     ]
     ```
+  - Local, uncompressed mzML files are parsed in parallel, in chunks of whole spectra (the spectra are the same as with the serial parse). Gzipped and remote files, and files with comments, CDATA sections or processing instructions between the spectra or another unusual layout, are parsed serially. Setting the environment variable `SAGE_MZML_SERIAL=1` forces the serial parse.
   
 ## Output directory:
 
