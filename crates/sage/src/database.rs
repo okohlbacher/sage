@@ -1842,6 +1842,27 @@ mod test {
     }
 
     #[test]
+    fn the_build_calls_the_registered_release_hook() {
+        use std::sync::atomic::{AtomicUsize, Ordering as Atomic};
+        static CALLS: AtomicUsize = AtomicUsize::new(0);
+        set_release_freed_memory(|| {
+            CALLS.fetch_add(1, Atomic::Relaxed);
+        });
+        let mut builder = Builder::default();
+        builder.update_fasta("unused".into());
+        let fasta = Fasta::parse(
+            include_str!("../../../tests/Q99536.fasta").into(),
+            "rev_",
+            true,
+        );
+        let before = CALLS.load(Atomic::Relaxed);
+        let db = builder.make_parameters().build(fasta);
+        assert!(!db.fragments.is_empty());
+        // once before the peptide sort, once before the fragment index
+        assert!(CALLS.load(Atomic::Relaxed) >= before + 2);
+    }
+
+    #[test]
     fn page_range_covers_the_same_fragments_as_a_full_page_search() {
         for bucket_size in [32, 64, 128, 1000, 8192] {
             let mut builder = Builder {
