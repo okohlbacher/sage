@@ -293,22 +293,11 @@ impl Parameters {
                 .total_cmp(&b.monoisotopic)
                 .then_with(|| a.initial_sort(b))
         });
-        target_decoys.dedup_by(|remove, keep| {
-            if remove.monoisotopic == keep.monoisotopic
-                && remove.sequence == keep.sequence
-                && remove.modifications == keep.modifications
-                && remove.nterm == keep.nterm
-                && remove.cterm == keep.cterm
-            {
-                keep.proteins.extend(remove.proteins.iter().cloned());
-                // When merging peptides from different Fastas,
-                // decoys in one fasta might be targets in another
-                keep.decoy &= remove.decoy;
-                true
-            } else {
-                false
-            }
-        });
+        let first = (0..target_decoys.len())
+            .into_par_iter()
+            .map(|i| i == 0 || !same_peptide(&target_decoys[i - 1], &target_decoys[i]))
+            .collect::<Vec<_>>();
+        *target_decoys = merge_runs(std::mem::take(target_decoys), &first);
 
         target_decoys
             .par_iter_mut()
@@ -642,6 +631,84 @@ fn retain_indexed(fragments: &mut Vec<Theoretical>, indexed: &[bool]) {
         a = c;
     }
     fragments.truncate(len);
+}
+
+/// Peptides that the database keeps only once: same mass, sequence, modifications and
+/// terminal modifications.
+fn same_peptide(a: &Peptide, b: &Peptide) -> bool {
+    a.monoisotopic == b.monoisotopic
+        && a.sequence == b.sequence
+        && a.modifications == b.modifications
+        && a.nterm == b.nterm
+        && a.cterm == b.cterm
+}
+
+/// Raw pointer to the peptides being moved by [`merge_runs`], shared by its workers.
+struct PeptidePtr(*mut Peptide);
+// SAFETY: the workers of `merge_runs` move disjoint elements out of the buffer.
+unsafe impl Sync for PeptidePtr {}
+
+/// Merges each run of equal peptides (`first[i]`: peptide `i` starts a run) into its
+/// first peptide, in parallel. The first peptide takes the proteins of the others in
+/// run order and stays a decoy only if all of them are decoys (when merging peptides
+/// from different FASTAs, a decoy in one may be a target in another).
+///
+/// The same result as the former serial `dedup_by`, which compared each peptide with
+/// the run's first: [`same_peptide`] is an equivalence relation, so comparing
+/// neighbours finds the same runs. The serial pass took 0.25-0.30 s at every thread
+/// count for 9 M peptides; here the runs are merged and moved block by block.
+fn merge_runs(mut peptides: Vec<Peptide>, first: &[bool]) -> Vec<Peptide> {
+    const BLOCK: usize = 1 << 14;
+    let n = peptides.len();
+    assert_eq!(first.len(), n);
+    let counts: Vec<usize> = first
+        .par_chunks(BLOCK)
+        .map(|block| block.iter().filter(|&&f| f).count())
+        .collect();
+    let total: usize = counts.iter().sum();
+
+    let mut merged: Vec<Peptide> = Vec::with_capacity(total);
+    let mut rest = &mut merged.spare_capacity_mut()[..total];
+    let mut blocks = Vec::with_capacity(counts.len());
+    for &count in &counts {
+        let (head, tail) = std::mem::take(&mut rest).split_at_mut(count);
+        blocks.push(head);
+        rest = tail;
+    }
+
+    let src = PeptidePtr(peptides.as_mut_ptr());
+    // SAFETY: every element is moved out exactly once below: block `b` moves the runs
+    // that start in it (including their continuation into later blocks). With length 0,
+    // a panic leaks the elements instead of dropping them twice; the buffer itself is
+    // freed when `peptides` goes out of scope.
+    unsafe { peptides.set_len(0) };
+    blocks.into_par_iter().enumerate().for_each(|(block, out)| {
+        let src = &src;
+        let take = |i: usize| unsafe { std::ptr::read(src.0.add(i)) };
+        let end = ((block + 1) * BLOCK).min(n);
+        let mut i = block * BLOCK;
+        // peptides before the first run start belong to a run of an earlier block
+        while i < end && !first[i] {
+            i += 1;
+        }
+        let mut k = 0;
+        while i < end {
+            let mut keep = take(i);
+            i += 1;
+            while i < n && !first[i] {
+                let duplicate = take(i);
+                keep.proteins.extend(duplicate.proteins);
+                keep.decoy &= duplicate.decoy;
+                i += 1;
+            }
+            out[k].write(keep);
+            k += 1;
+        }
+        assert_eq!(k, out.len(), "run count changed between passes");
+    });
+    // SAFETY: the blocks tile `0..total` and each wrote `out.len()` elements (asserted).
+    unsafe { merged.set_len(total) };
+    merged
 }
 
 /// Ask the kernel to back `buf` with transparent huge pages before it is touched.
@@ -1556,6 +1623,113 @@ mod test {
         assert_eq!(peptides.len(), 1);
         assert!(!peptides[0].decoy);
         assert_eq!(peptides[0].proteins, vec![Arc::from("P1")]);
+    }
+
+    /// The former serial version of [`Parameters::sort_and_dedup`]
+    fn sort_and_dedup_serial(target_decoys: &mut Vec<Peptide>) {
+        target_decoys.par_sort_unstable_by(|a, b| {
+            a.monoisotopic
+                .total_cmp(&b.monoisotopic)
+                .then_with(|| a.initial_sort(b))
+        });
+        target_decoys.dedup_by(|remove, keep| {
+            if remove.monoisotopic == keep.monoisotopic
+                && remove.sequence == keep.sequence
+                && remove.modifications == keep.modifications
+                && remove.nterm == keep.nterm
+                && remove.cterm == keep.cterm
+            {
+                keep.proteins.extend(remove.proteins.iter().cloned());
+                keep.decoy &= remove.decoy;
+                true
+            } else {
+                false
+            }
+        });
+        target_decoys
+            .par_iter_mut()
+            .for_each(|peptide| peptide.proteins.sort_unstable());
+    }
+
+    /// Peptides of a non-specific digest of Q99536 with duplicates that differ in
+    /// protein, decoy flag, position and missed cleavages, same-mass variants (reversed
+    /// sequences, a modification on another residue), and one run of identical
+    /// peptides longer than a block of `merge_runs`
+    fn peptides_with_duplicates() -> Vec<Peptide> {
+        let fasta = Fasta::parse(
+            include_str!("../../../tests/Q99536.fasta").into(),
+            "rev_",
+            false,
+        );
+        let enzyme = EnzymeParameters {
+            missed_cleavages: 0,
+            min_len: 5,
+            max_len: 30,
+            enzyme: None,
+        };
+        let (protein, sequence) = &fasta.targets[0];
+        let base = enzyme
+            .digest(sequence, protein.clone())
+            .into_iter()
+            .map(|digest| Peptide::try_from(digest).unwrap())
+            .collect::<Vec<_>>();
+        let mut peptides = Vec::new();
+        for (i, peptide) in base.iter().enumerate() {
+            peptides.push(peptide.clone());
+            peptides.push(peptide.reverse());
+            if i % 3 == 0 {
+                let mut dup = peptide.clone();
+                dup.proteins = vec![Arc::from(format!("P{}", i % 7))];
+                dup.decoy = i % 2 == 0;
+                dup.missed_cleavages = 1;
+                dup.position = crate::enzyme::Position::Nterm;
+                peptides.push(dup);
+            }
+            if i % 5 == 0 && peptide.sequence.len() > 3 {
+                for site in [1, 2] {
+                    let mut modified = peptide.clone();
+                    modified.modifications[site] += 15.9949;
+                    modified.monoisotopic += 15.9949;
+                    peptides.push(modified.clone());
+                    modified.proteins = vec![Arc::from("PM")];
+                    peptides.push(modified);
+                }
+            }
+        }
+        for i in 0..40_000 {
+            let mut dup = base[17].clone();
+            dup.proteins = vec![Arc::from(format!("R{}", i % 11))];
+            dup.semi_enzymatic = i % 3 == 0;
+            peptides.push(dup);
+        }
+        // a deterministic shuffle: the result of the unstable sort depends on the input order
+        let n = peptides.len();
+        let mut j = 7usize;
+        for i in (1..n).rev() {
+            j = (j * 1_103_515_245 + 12_345) % 2_147_483_648;
+            peptides.swap(i, j % (i + 1));
+        }
+        peptides
+    }
+
+    #[test]
+    fn sort_and_dedup_matches_the_serial_version() {
+        let peptides = peptides_with_duplicates();
+        let mut expected = peptides.clone();
+        sort_and_dedup_serial(&mut expected);
+        assert!(expected.len() < peptides.len() / 2);
+        for threads in [1, 3, 8] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            let mut got = peptides.clone();
+            pool.install(|| Parameters::sort_and_dedup(&mut got));
+            assert!(got == expected, "{threads} threads");
+        }
+        let mut empty = Vec::new();
+        Parameters::sort_and_dedup(&mut empty);
+        assert!(empty.is_empty());
     }
 
     #[test]
