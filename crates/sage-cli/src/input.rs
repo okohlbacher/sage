@@ -89,27 +89,39 @@ pub struct Input {
 /// `max_peaks` as written in the configuration: a number of peaks, or `"auto"` (the default)
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub enum MaxPeaks {
-    /// Depends on the fragment tolerance: [`MaxPeaks::AUTO_PPM`] for ppm (and pct),
-    /// [`MaxPeaks::AUTO_DA`] for Da
+    /// Depends on the fragment tolerance (see [`MaxPeaks::resolve`])
     #[default]
     Auto,
     Count(usize),
 }
 
 impl MaxPeaks {
-    /// Peaks kept per MS2 spectrum by `"auto"` with a ppm or pct fragment tolerance
-    /// (high-resolution fragment spectra)
-    pub const AUTO_PPM: usize = 400;
-    /// Peaks kept per MS2 spectrum by `"auto"` with a Da fragment tolerance (low-resolution
-    /// fragment spectra, e.g. ion trap CID at 0.5 Da)
-    pub const AUTO_DA: usize = 80;
+    /// Peaks kept per MS2 spectrum by `"auto"` for high-resolution fragment spectra
+    pub const AUTO_HIGH_RES: usize = 400;
+    /// Peaks kept per MS2 spectrum by `"auto"` for low-resolution fragment spectra
+    /// (e.g. ion trap CID searched at 0.5 Da)
+    pub const AUTO_LOW_RES: usize = 80;
+    /// A Da fragment tolerance at least this wide (on either side) means low resolution
+    pub const LOW_RES_DA: f32 = 0.1;
 
-    /// The number of peaks to keep per MS2 spectrum
+    /// Does `"auto"` treat this fragment tolerance as low resolution? Only Da tolerances
+    /// of at least [`MaxPeaks::LOW_RES_DA`]; ppm and pct tolerances are high resolution.
+    pub fn low_resolution(fragment_tol: &Tolerance) -> bool {
+        match fragment_tol {
+            Tolerance::Da(lo, hi) => lo.abs().max(hi.abs()) >= Self::LOW_RES_DA,
+            Tolerance::Ppm(..) | Tolerance::Pct(..) => false,
+        }
+    }
+
+    /// The number of peaks to keep per MS2 spectrum: an explicit count as given; `"auto"`
+    /// gives [`MaxPeaks::AUTO_LOW_RES`] for a Da fragment tolerance of at least
+    /// ±[`MaxPeaks::LOW_RES_DA`] and [`MaxPeaks::AUTO_HIGH_RES`] otherwise (ppm, pct, or a
+    /// narrow Da tolerance such as ±0.02 Da)
     pub fn resolve(self, fragment_tol: &Tolerance) -> usize {
-        match (self, fragment_tol) {
-            (MaxPeaks::Count(n), _) => n,
-            (MaxPeaks::Auto, Tolerance::Ppm(..) | Tolerance::Pct(..)) => Self::AUTO_PPM,
-            (MaxPeaks::Auto, Tolerance::Da(..)) => Self::AUTO_DA,
+        match self {
+            MaxPeaks::Count(n) => n,
+            MaxPeaks::Auto if Self::low_resolution(fragment_tol) => Self::AUTO_LOW_RES,
+            MaxPeaks::Auto => Self::AUTO_HIGH_RES,
         }
     }
 }
@@ -435,13 +447,13 @@ impl Input {
         let max_peaks_resolved = max_peaks.resolve(&self.fragment_tol);
         if max_peaks == MaxPeaks::Auto {
             log::info!(
-                "max_peaks: auto -> {} peaks per MS2 spectrum ({} fragment tolerance)",
+                "max_peaks: auto -> {} peaks per MS2 spectrum ({:?} fragment tolerance: {} resolution)",
                 max_peaks_resolved,
-                match self.fragment_tol {
-                    Tolerance::Ppm(..) => "ppm",
-                    Tolerance::Pct(..) => "pct",
-                    Tolerance::Da(..) => "Da",
-                }
+                self.fragment_tol,
+                match MaxPeaks::low_resolution(&self.fragment_tol) {
+                    true => "low",
+                    false => "high",
+                },
             );
         }
 
@@ -508,29 +520,36 @@ mod test {
         use serde_json::json;
         let ppm = json!({ "ppm": [-20.0, 20.0] });
         let da = json!({ "da": [-0.5, 0.5] });
+        let narrow_da = json!({ "da": [-0.02, 0.02] });
         let pct = json!({ "pct": [-0.002, 0.002] });
 
-        // not set, null and "auto" are the same: 400 for ppm/pct, 80 for Da
+        // not set, null and "auto" are the same: 400 for ppm, pct and narrow Da, 80 for wide Da
         for max_peaks in [None, Some(json!(null)), Some(json!("auto"))] {
             assert_eq!(resolved_max_peaks(ppm.clone(), max_peaks.clone())?, 400);
             assert_eq!(resolved_max_peaks(pct.clone(), max_peaks.clone())?, 400);
+            assert_eq!(
+                resolved_max_peaks(narrow_da.clone(), max_peaks.clone())?,
+                400
+            );
             assert_eq!(resolved_max_peaks(da.clone(), max_peaks)?, 80);
         }
-        // an explicit number is used as given, whatever the tolerance unit
-        for tol in [&ppm, &da, &pct] {
+        // an explicit number is used as given, whatever the tolerance
+        for tol in [&ppm, &da, &narrow_da, &pct] {
             assert_eq!(resolved_max_peaks(tol.clone(), Some(json!(150)))?, 150);
             assert_eq!(resolved_max_peaks(tol.clone(), Some(json!(0)))?, 0);
         }
 
         assert_eq!(MaxPeaks::default(), MaxPeaks::Auto);
-        assert_eq!(
-            MaxPeaks::Auto.resolve(&Tolerance::Ppm(-5.0, 5.0)),
-            MaxPeaks::AUTO_PPM
-        );
-        assert_eq!(
-            MaxPeaks::Auto.resolve(&Tolerance::Da(-0.02, 0.02)),
-            MaxPeaks::AUTO_DA
-        );
+        let auto = |tol: Tolerance| MaxPeaks::Auto.resolve(&tol);
+        assert_eq!(auto(Tolerance::Ppm(-5.0, 5.0)), MaxPeaks::AUTO_HIGH_RES);
+        assert_eq!(auto(Tolerance::Ppm(-500.0, 500.0)), MaxPeaks::AUTO_HIGH_RES);
+        assert_eq!(auto(Tolerance::Da(-0.05, 0.05)), MaxPeaks::AUTO_HIGH_RES);
+        assert_eq!(auto(Tolerance::Da(-0.099, 0.099)), MaxPeaks::AUTO_HIGH_RES);
+        // low resolution from +-0.1 Da on, on either side
+        assert_eq!(auto(Tolerance::Da(-0.1, 0.1)), MaxPeaks::AUTO_LOW_RES);
+        assert_eq!(auto(Tolerance::Da(-1.0005, 1.0005)), MaxPeaks::AUTO_LOW_RES);
+        assert_eq!(auto(Tolerance::Da(-0.5, 0.0)), MaxPeaks::AUTO_LOW_RES);
+        assert_eq!(auto(Tolerance::Da(-0.01, 0.4)), MaxPeaks::AUTO_LOW_RES);
         assert_eq!(MaxPeaks::Count(42).resolve(&Tolerance::Da(-0.5, 0.5)), 42);
         Ok(())
     }
