@@ -7,6 +7,8 @@ use sage_cli::input::Input;
 use sage_cli::runner::Runner;
 
 fn main() -> anyhow::Result<()> {
+    // give freed memory back to the OS before the database build's allocation peaks
+    sage_core::database::set_release_freed_memory(sage_cli::release_freed_memory);
     env_logger::Builder::default()
         .filter_level(log::LevelFilter::Error)
         .parse_env(env_logger::Env::default().filter_or("SAGE_LOG", "error,sage=info"))

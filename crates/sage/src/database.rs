@@ -286,6 +286,7 @@ impl Parameters {
 
     fn sort_and_dedup(target_decoys: &mut Vec<Peptide>) {
         log::trace!("sorting and deduplicating peptides");
+        release_freed_memory();
         let init_size = target_decoys.len();
         // sorted by mass, then `initial_sort`; `order[i].index` is the i-th peptide
         let order = sorted_order(target_decoys);
@@ -457,6 +458,8 @@ impl Parameters {
         target_decoys: Vec<Peptide>,
         reachable: &mut dyn FnMut(&IndexedDatabase) -> Option<Vec<bool>>,
     ) -> IndexedDatabase {
+        // the memory that the digest step freed goes back before the index is allocated
+        release_freed_memory();
         // the peptide list alone, for `reachable`
         let db = IndexedDatabase {
             peptides: target_decoys,
@@ -771,6 +774,24 @@ fn merge_runs(
     // SAFETY: the blocks tile `0..total` and each wrote `out.len()` elements (asserted).
     unsafe { merged.set_len(total) };
     merged
+}
+
+static RELEASE_FREED_MEMORY: std::sync::OnceLock<fn()> = std::sync::OnceLock::new();
+
+/// Registers how the program's global allocator gives memory that was freed back to
+/// the OS at once (`sage` registers mimalloc's `mi_collect(true)`). The database build
+/// calls it before its two allocation peaks, the peptide sort and the fragment index:
+/// an allocator that returns freed memory only after a delay (mimalloc v3: one second)
+/// would otherwise keep the digest's and the sort's freed memory resident under them,
+/// by an amount that depends on how quickly the phases before them finished.
+pub fn set_release_freed_memory(release: fn()) {
+    let _ = RELEASE_FREED_MEMORY.set(release);
+}
+
+fn release_freed_memory() {
+    if let Some(release) = RELEASE_FREED_MEMORY.get() {
+        release();
+    }
 }
 
 /// Ask the kernel to back `buf` with transparent huge pages before it is touched.
