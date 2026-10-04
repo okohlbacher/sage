@@ -726,6 +726,10 @@ impl Runner {
         // heap allocations each) one by one takes seconds on a single thread
         // (3 s for human tryptic); let the OS reclaim the memory at exit instead.
         std::mem::forget(std::mem::take(&mut self.database));
+        // Likewise the search results (with `report_psms` > 1 up to ~10^6 features with
+        // several strings each, plus the MS1 spectra with LFQ), allocated on the worker
+        // threads: one thread freeing them pays mimalloc's cross-thread frees.
+        std::mem::forget(outputs);
 
         Ok(telemetry)
     }
