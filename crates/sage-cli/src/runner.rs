@@ -141,12 +141,14 @@ impl Runner {
                             / parameters.database.prefilter_chunk_size,
                         parameters.database.prefilter_chunk_size,
                     );
-                    let mini_runner = Self {
+                    let mut mini_runner = Self {
                         database: IndexedDatabase::default(),
                         parameters: parameters.clone(),
                         start,
                         first_batch: None,
                     };
+                    // the prefilter pass does not need the ion model's peak lists
+                    mini_runner.parameters.ion_model = false;
                     let peptides = mini_runner.prefilter_peptides(parallel, fasta)?;
                     parameters.database.clone().build_from_peptides(peptides)
                 }
@@ -377,8 +379,21 @@ impl Runner {
         self.parameters.quant.lfq
     }
 
-    fn process_chunk(&self, scorer: &Scorer, spectra: Spectra) -> SageResults {
-        let features = self.search_processed_spectra(scorer, &spectra.1);
+    fn process_chunk(&self, scorer: &Scorer, mut spectra: Spectra) -> SageResults {
+        let mut features = self.search_processed_spectra(scorer, &spectra.1);
+        if self.parameters.ion_model {
+            let start = Instant::now();
+            sage_core::ion_model::annotate(
+                &mut features,
+                &spectra.1,
+                &self.database,
+                self.parameters.fragment_tol,
+                sage_core::ion_model::MIN_TRAINING_PSMS,
+            );
+            // the peak lists are not needed any more
+            spectra.1.iter_mut().for_each(|s| s.ion_evidence = None);
+            info!("- ion model: {:8} ms", start.elapsed().as_millis());
+        }
         self.complete_features(spectra.1, spectra.0, features)
     }
 
@@ -426,7 +441,8 @@ impl Runner {
             self.parameters.max_peaks,
             self.parameters.deisotope,
             min_deisotope_mz.unwrap_or(0.0),
-        );
+        )
+        .with_ion_evidence(self.parameters.ion_model);
 
         // If the file format supports parallel reading, then we can read
         // then it is faster to read each file in series. (since each spectra
@@ -825,6 +841,10 @@ impl Runner {
                 .as_bytes(),
         );
         record.push_field(ryu::Buffer::new().format(feature.ms2_intensity).as_bytes());
+        if self.parameters.ion_model {
+            record.push_field(ryu::Buffer::new().format(feature.ion_llr).as_bytes());
+            record.push_field(ryu::Buffer::new().format(feature.ion_explained).as_bytes());
+        }
         record
     }
 
@@ -883,7 +903,7 @@ impl Runner {
     ) -> anyhow::Result<Url> {
         let path = self.make_path("results.sage.tsv");
 
-        let csv_headers = vec![
+        let mut csv_headers = vec![
             "psm_id",
             "peptide",
             "proteins",
@@ -928,6 +948,9 @@ impl Runner {
             "protein_group_q",
             "ms2_intensity",
         ];
+        if self.parameters.ion_model {
+            csv_headers.extend(["ion_llr", "ion_explained"]);
+        }
 
         let headers = csv::ByteRecord::from(csv_headers);
         let bytes = tsv_bytes(&headers, features, |feat| {
@@ -1094,6 +1117,10 @@ impl Runner {
                 .format((-feature.poisson).ln_1p())
                 .as_bytes(),
         );
+        if self.parameters.ion_model {
+            record.push_field(ryu::Buffer::new().format(feature.ion_llr).as_bytes());
+            record.push_field(ryu::Buffer::new().format(feature.ion_explained).as_bytes());
+        }
         // `posterior_error` is not a PIN feature: it comes from Sage's own LDA, trained on
         // the target/decoy labels of these same PSMs, so it would leak the labels into the
         // rescorer (Percolator/mokapot cross-validation cannot undo that)
@@ -1109,7 +1136,7 @@ impl Runner {
     pub fn write_pin(&self, features: &[Feature], filenames: &[String]) -> anyhow::Result<Url> {
         let path = self.make_path("results.sage.pin");
 
-        let headers = csv::ByteRecord::from(vec![
+        let mut headers = vec![
             "SpecId",
             "Label",
             "ScanNr",
@@ -1146,9 +1173,12 @@ impl Runner {
             "ln(matched_intensity_pct)",
             "scored_candidates",
             "ln(-poisson)",
-            "Peptide",
-            "Proteins",
-        ]);
+        ];
+        if self.parameters.ion_model {
+            headers.extend(["ion_llr", "ion_explained"]);
+        }
+        headers.extend(["Peptide", "Proteins"]);
+        let headers = csv::ByteRecord::from(headers);
 
         let re = regex::Regex::new(r"scan=(\d+)").expect("This is valid regex");
 

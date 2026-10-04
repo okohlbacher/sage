@@ -1,4 +1,5 @@
 use crate::database::binary_search_slice;
+use crate::ion_model::IonEvidence;
 use crate::mass::{Tolerance, NEUTRON, PROTON};
 
 /// A de-isotoped peak, that might have some charge state information
@@ -18,6 +19,9 @@ pub struct SpectrumProcessor {
     pub take_top_n: usize,
     pub min_deisotope_mz: f32,
     pub deisotope: bool,
+    /// Keep every deisotoped MS2 peak (before the `take_top_n` cut) as [`IonEvidence`]
+    /// for the fragment-ion model
+    pub ion_evidence: bool,
 }
 
 #[derive(Default, Debug, Clone)]
@@ -55,6 +59,8 @@ pub struct ProcessedSpectrum {
     pub mobilities: Vec<f32>,
     /// Total ion current
     pub total_ion_current: f32,
+    /// All deisotoped MS2 peaks, for the fragment-ion model (if enabled)
+    pub ion_evidence: Option<IonEvidence>,
 }
 
 static PROFILE_WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -400,14 +406,21 @@ impl SpectrumProcessor {
             take_top_n,
             min_deisotope_mz,
             deisotope,
+            ion_evidence: false,
         }
+    }
+
+    /// Also keep the [`IonEvidence`] of MS2 spectra (all deisotoped peaks)
+    pub fn with_ion_evidence(mut self, ion_evidence: bool) -> Self {
+        self.ion_evidence = ion_evidence;
+        self
     }
 
     fn process_ms2(
         &self,
         should_deisotope: bool,
         spectrum: &RawSpectrum,
-    ) -> (Vec<f32>, Vec<f32>, Vec<u8>) {
+    ) -> (Vec<f32>, Vec<f32>, Vec<u8>, Option<IonEvidence>) {
         if spectrum.representation != Representation::Centroid {
             // Nothing sensible can be done with profile data. Skip the spectrum (it has no
             // peaks afterwards) instead of aborting the whole run.
@@ -451,6 +464,19 @@ impl SpectrumProcessor {
                 .filter_map(|(idx, peak)| peak.envelope.is_none().then_some(idx))
                 .collect::<Vec<_>>();
 
+            // every deisotoped peak, before the top-N cut
+            let evidence = self.ion_evidence.then(|| {
+                let masses = indices
+                    .iter()
+                    .map(|&idx| (mz[idx] - PROTON) * charges[idx] as f32)
+                    .collect::<Vec<_>>();
+                let heads = indices
+                    .iter()
+                    .map(|&idx| intensities[idx])
+                    .collect::<Vec<_>>();
+                IonEvidence::new(&masses, &heads)
+            });
+
             retain_top_n_by_intensity(&mut indices, &mz, &intensities, self.take_top_n, true);
 
             let mut masses = Vec::with_capacity(indices.len());
@@ -463,7 +489,7 @@ impl SpectrumProcessor {
                 selected_charges.push(charge);
             }
 
-            (masses, selected_intensities, selected_charges)
+            (masses, selected_intensities, selected_charges, evidence)
         } else {
             let masses = spectrum
                 .mz
@@ -472,9 +498,14 @@ impl SpectrumProcessor {
                 .collect::<Vec<_>>();
             let intensities = spectrum.intensity.clone();
             let charges = vec![1; masses.len()];
+            let evidence = self
+                .ion_evidence
+                .then(|| IonEvidence::new(&masses, &intensities));
             let mut indices = (0..masses.len()).collect::<Vec<_>>();
             retain_top_n_by_intensity(&mut indices, &masses, &intensities, self.take_top_n, false);
-            select_columns(indices, &masses, &intensities, &charges)
+            let (masses, intensities, charges) =
+                select_columns(indices, &masses, &intensities, &charges);
+            (masses, intensities, charges, evidence)
         }
     }
 
@@ -522,6 +553,7 @@ impl SpectrumProcessor {
             spectrum.mobility = None;
         }
 
+        let mut ion_evidence = None;
         let (masses, intensities, charges, mobilities) =
             if spectrum.ms_level == 1 && spectrum.mobility.is_some() {
                 let raw_mobilities = spectrum.mobility.as_ref().expect("checked above");
@@ -536,7 +568,12 @@ impl SpectrumProcessor {
                 sort_columns_by_mass(masses, intensities, charges, mobilities)
             } else {
                 let (masses, intensities, charges) = match spectrum.ms_level {
-                    2 => self.process_ms2(self.deisotope, &spectrum),
+                    2 => {
+                        let (masses, intensities, charges, evidence) =
+                            self.process_ms2(self.deisotope, &spectrum);
+                        ion_evidence = evidence;
+                        (masses, intensities, charges)
+                    }
                     _ => {
                         let masses = spectrum
                             .mz
@@ -565,6 +602,7 @@ impl SpectrumProcessor {
             charges,
             mobilities,
             total_ion_current,
+            ion_evidence,
         }
     }
 }

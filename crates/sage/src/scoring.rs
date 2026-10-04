@@ -156,6 +156,16 @@ pub struct Feature {
     pub num_protein_groups: u32,
 
     pub fragments: Option<Fragments>,
+
+    /// HyperScore on intensities normalised to the most intense peak of the spectrum
+    /// (label-free score that selects the fragment-ion model's training PSMs)
+    #[serde(skip_serializing)]
+    pub normalized_hyperscore: f64,
+    /// Fragment-ion model: log-likelihood ratio of the fragment evidence, signal vs noise
+    /// (0 unless the ion model is enabled and trained)
+    pub ion_llr: f32,
+    /// Fragment-ion model: share of the expected ions that were found
+    pub ion_explained: f32,
 }
 
 /// Matching Fragment details
@@ -772,6 +782,8 @@ impl<'db> Scorer<'db> {
         // Sage operates on masses without protons; [M] instead of [MH+]
         let mz = precursor.mz - PROTON;
 
+        let max_intensity = query.intensities.iter().copied().fold(0.0f32, f32::max);
+
         for idx in 0..report_psms.min(score_vector.len()) {
             let score = score_vector[idx].0;
             let fragments: Option<Fragments> = score_vector[idx].1.take();
@@ -800,6 +812,15 @@ impl<'db> Scorer<'db> {
             let isotope_error = score.isotope_error as f32 * NEUTRON;
             let delta_mass = (precursor_mass - peptide.monoisotopic - isotope_error) * 2E6
                 / (precursor_mass - isotope_error + peptide.monoisotopic);
+
+            let normalized_hyperscore = if max_intensity > 0.0 {
+                let norm = max_intensity as f64;
+                ((score.summed_b as f64 / norm + 1.0) * (score.summed_y as f64 / norm + 1.0)).ln()
+                    + lnfact(score.matched_b)
+                    + lnfact(score.matched_y)
+            } else {
+                0.0
+            };
 
             // let (num_proteins, proteins) = self.db.assign_proteins(peptide);
 
@@ -861,6 +882,10 @@ impl<'db> Scorer<'db> {
                 num_protein_groups: 0,
                 fragments,
                 protein_group_q: 1.0,
+
+                normalized_hyperscore,
+                ion_llr: 0.0,
+                ion_explained: 0.0,
             })
         }
     }

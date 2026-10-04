@@ -36,6 +36,8 @@ pub struct Search {
     pub bruker_config: BrukerProcessingConfig,
     pub protein_grouping: bool,
     pub protein_grouping_peptide_fdr: f32,
+    /// Self-trained, cross-fitted fragment-ion model: `ion_llr` and `ion_explained` columns
+    pub ion_model: bool,
 
     #[serde(skip_serializing)]
     pub output_directory: Url,
@@ -76,6 +78,7 @@ pub struct Input {
     pub bruker_config: Option<BrukerProcessingConfig>,
     pub protein_grouping: Option<bool>,
     pub protein_grouping_peptide_fdr: Option<f32>,
+    pub ion_model: Option<bool>,
 
     pub annotate_matches: Option<bool>,
     pub write_pin: Option<bool>,
@@ -394,6 +397,7 @@ impl Input {
             write_report: self.write_report.unwrap_or(false),
             protein_grouping: self.protein_grouping.unwrap_or(true),
             protein_grouping_peptide_fdr: self.protein_grouping_peptide_fdr.unwrap_or(0.01),
+            ion_model: self.ion_model.unwrap_or(false),
             score_type,
         })
     }
