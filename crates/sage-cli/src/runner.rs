@@ -248,6 +248,13 @@ impl Runner {
                 chunk_id,
             );
             all_peptides.extend(peptides);
+            // This chunk's index and peptides go back to the OS before the next chunk is
+            // digested: the allocator (mimalloc v3) keeps freed memory committed for up to
+            // 1 s, and the next chunk's digest and modified peptides would pile up on them
+            // (the peak of a prefilter run)
+            drop(keep);
+            drop(db);
+            sage_core::database::release_freed_memory();
         }
 
         Parameters::reorder_peptides(&mut all_peptides);

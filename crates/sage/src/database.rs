@@ -788,7 +788,9 @@ pub fn set_release_freed_memory(release: fn()) {
     let _ = RELEASE_FREED_MEMORY.set(release);
 }
 
-fn release_freed_memory() {
+/// Gives the memory that was freed back to the OS at once, through the function
+/// registered with [`set_release_freed_memory`] (does nothing if none is registered)
+pub fn release_freed_memory() {
     if let Some(release) = RELEASE_FREED_MEMORY.get() {
         release();
     }
