@@ -138,7 +138,7 @@ fn main() -> anyhow::Result<()> {
         .build()
         .and_then(|parameters| Runner::new(parameters, parallel))?;
 
-    let tel = runner.run(parallel, parquet)?;
+    let tel = runner.run_then_exit(parallel, parquet)?;
 
     if send_telemetry {
         tel.send();

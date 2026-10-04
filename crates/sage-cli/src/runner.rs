@@ -556,7 +556,29 @@ impl Runner {
         }
     }
 
-    pub fn run(mut self, parallel: usize, parquet: bool) -> anyhow::Result<telemetry::Telemetry> {
+    /// Run the search and write the outputs; the database and the results are freed
+    /// before this returns.
+    pub fn run(self, parallel: usize, parquet: bool) -> anyhow::Result<telemetry::Telemetry> {
+        self.run_inner(parallel, parquet, false)
+    }
+
+    /// As [`Runner::run`], for a process that exits right after it (the `sage` binary):
+    /// the database and the search results are left to the OS instead of being freed one
+    /// by one. Each call leaks them, so a long-running caller must use [`Runner::run`].
+    pub fn run_then_exit(
+        self,
+        parallel: usize,
+        parquet: bool,
+    ) -> anyhow::Result<telemetry::Telemetry> {
+        self.run_inner(parallel, parquet, true)
+    }
+
+    fn run_inner(
+        mut self,
+        parallel: usize,
+        parquet: bool,
+        leak: bool,
+    ) -> anyhow::Result<telemetry::Telemetry> {
         let scorer = self.scorer(&self.database);
 
         //Collect all results into a single container
@@ -739,14 +761,16 @@ impl Runner {
             run_time,
         );
 
-        // `run` is the last thing the process does. Freeing ~10^7 peptides (several
-        // heap allocations each) one by one takes seconds on a single thread
-        // (3 s for human tryptic); let the OS reclaim the memory at exit instead.
-        std::mem::forget(std::mem::take(&mut self.database));
+        // With `run_then_exit` this is the last thing the process does. Freeing ~10^7
+        // peptides (several heap allocations each) one by one takes seconds on a single
+        // thread (3 s for human tryptic); let the OS reclaim the memory at exit instead.
         // Likewise the search results (with `report_psms` > 1 up to ~10^6 features with
         // several strings each, plus the MS1 spectra with LFQ), allocated on the worker
         // threads: one thread freeing them pays mimalloc's cross-thread frees.
-        std::mem::forget(outputs);
+        if leak {
+            std::mem::forget(std::mem::take(&mut self.database));
+            std::mem::forget(outputs);
+        }
 
         Ok(telemetry)
     }
