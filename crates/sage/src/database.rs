@@ -287,17 +287,24 @@ impl Parameters {
     fn sort_and_dedup(target_decoys: &mut Vec<Peptide>) {
         log::trace!("sorting and deduplicating peptides");
         let init_size = target_decoys.len();
-        // This is equivalent to a stable sort
-        target_decoys.par_sort_unstable_by(|a, b| {
-            a.monoisotopic
-                .total_cmp(&b.monoisotopic)
-                .then_with(|| a.initial_sort(b))
-        });
-        let first = (0..target_decoys.len())
+        // sorted by mass, then `initial_sort`; `order[i].index` is the i-th peptide
+        let order = sorted_order(target_decoys);
+        let peptides = &target_decoys[..];
+        let first = (0..order.len())
             .into_par_iter()
-            .map(|i| i == 0 || !same_peptide(&target_decoys[i - 1], &target_decoys[i]))
+            .map(|i| {
+                i == 0 || {
+                    let (a, b) = (&order[i - 1], &order[i]);
+                    // equal peptides have equal keys; compare the peptides only then
+                    !(a.monoisotopic == b.monoisotopic
+                        && a.prefix == b.prefix
+                        && same_peptide(&peptides[a.index as usize], &peptides[b.index as usize]))
+                }
+            })
             .collect::<Vec<_>>();
-        *target_decoys = merge_runs(std::mem::take(target_decoys), &first);
+        *target_decoys = merge_runs(std::mem::take(target_decoys), &first, |i| {
+            order[i].index as usize
+        });
 
         target_decoys
             .par_iter_mut()
@@ -648,16 +655,70 @@ struct PeptidePtr(*mut Peptide);
 // SAFETY: the workers of `merge_runs` move disjoint elements out of the buffer.
 unsafe impl Sync for PeptidePtr {}
 
-/// Merges each run of equal peptides (`first[i]`: peptide `i` starts a run) into its
-/// first peptide, in parallel. The first peptide takes the proteins of the others in
-/// run order and stays a decoy only if all of them are decoys (when merging peptides
-/// from different FASTAs, a decoy in one may be a target in another).
+/// Sort key of a peptide: its mass, its first eight residues (zero padded, read as a
+/// big-endian number, so that the prefixes order like the sequences) and its index.
+#[derive(Clone, Copy)]
+struct SortKey {
+    monoisotopic: f32,
+    index: u32,
+    prefix: u64,
+}
+
+fn sequence_prefix(sequence: &[u8]) -> u64 {
+    let mut bytes = [0u8; 8];
+    let n = sequence.len().min(8);
+    bytes[..n].copy_from_slice(&sequence[..n]);
+    u64::from_be_bytes(bytes)
+}
+
+/// The order in which `par_sort_unstable_by(mass, then initial_sort)` puts `peptides`
+/// (`order[i].index` is the i-th peptide), found by sorting 16-byte keys instead of
+/// moving the ~100-byte peptides through every partition step.
+///
+/// Rayon's quicksort makes the same moves for any element type as long as the
+/// comparisons give the same results, and the key comparison gives the result of the
+/// peptide comparison: masses first; for equal masses, prefixes that differ order like
+/// the sequences, and equal prefixes compare the peptides themselves. So this is the
+/// same permutation, including the order of peptides that compare equal, which decides
+/// whose position, missed cleavages and semi-enzymatic flag a merged duplicate keeps.
+fn sorted_order(peptides: &[Peptide]) -> Vec<SortKey> {
+    let mut order = peptides
+        .par_iter()
+        .enumerate()
+        .map(|(index, peptide)| SortKey {
+            monoisotopic: peptide.monoisotopic,
+            index: u32::try_from(index).expect("more than 2^32 peptides"),
+            prefix: sequence_prefix(&peptide.sequence),
+        })
+        .collect::<Vec<_>>();
+    order.par_sort_unstable_by(|a, b| {
+        a.monoisotopic
+            .total_cmp(&b.monoisotopic)
+            .then_with(|| match a.prefix.cmp(&b.prefix) {
+                Ordering::Equal => {
+                    peptides[a.index as usize].initial_sort(&peptides[b.index as usize])
+                }
+                unequal => unequal,
+            })
+    });
+    order
+}
+
+/// Moves `peptides` into a new vector in sorted order (`at(i)` is the index of the i-th
+/// peptide) and merges each run of equal peptides (`first[i]`: the i-th peptide starts
+/// a run) into its first peptide, in parallel. The first peptide takes the proteins of
+/// the others in run order and stays a decoy only if all of them are decoys (when
+/// merging peptides from different FASTAs, a decoy in one may be a target in another).
 ///
 /// The same result as the former serial `dedup_by`, which compared each peptide with
 /// the run's first: [`same_peptide`] is an equivalence relation, so comparing
 /// neighbours finds the same runs. The serial pass took 0.25-0.30 s at every thread
 /// count for 9 M peptides; here the runs are merged and moved block by block.
-fn merge_runs(mut peptides: Vec<Peptide>, first: &[bool]) -> Vec<Peptide> {
+fn merge_runs(
+    mut peptides: Vec<Peptide>,
+    first: &[bool],
+    at: impl Fn(usize) -> usize + Sync,
+) -> Vec<Peptide> {
     const BLOCK: usize = 1 << 14;
     let n = peptides.len();
     assert_eq!(first.len(), n);
@@ -677,14 +738,15 @@ fn merge_runs(mut peptides: Vec<Peptide>, first: &[bool]) -> Vec<Peptide> {
     }
 
     let src = PeptidePtr(peptides.as_mut_ptr());
-    // SAFETY: every element is moved out exactly once below: block `b` moves the runs
-    // that start in it (including their continuation into later blocks). With length 0,
-    // a panic leaks the elements instead of dropping them twice; the buffer itself is
-    // freed when `peptides` goes out of scope.
+    // SAFETY: `at` is a permutation of `0..n`, and every position is moved out exactly
+    // once below: block `b` moves the runs that start in it (including their
+    // continuation into later blocks). With length 0, a panic leaks the elements instead
+    // of dropping them twice; the buffer itself is freed when `peptides` goes out of
+    // scope.
     unsafe { peptides.set_len(0) };
     blocks.into_par_iter().enumerate().for_each(|(block, out)| {
         let src = &src;
-        let take = |i: usize| unsafe { std::ptr::read(src.0.add(i)) };
+        let take = |i: usize| unsafe { std::ptr::read(src.0.add(at(i))) };
         let end = ((block + 1) * BLOCK).min(n);
         let mut i = block * BLOCK;
         // peptides before the first run start belong to a run of an earlier block
@@ -1710,6 +1772,32 @@ mod test {
             peptides.swap(i, j % (i + 1));
         }
         peptides
+    }
+
+    #[test]
+    fn sorted_order_is_the_permutation_of_the_peptide_sort() {
+        // a unique protein per peptide makes every permutation visible
+        let peptides = peptides_with_duplicates()
+            .into_iter()
+            .enumerate()
+            .map(|(i, mut peptide)| {
+                peptide.proteins.push(Arc::from(format!("#{i}")));
+                peptide
+            })
+            .collect::<Vec<_>>();
+        assert!(peptides.iter().any(|p| p.sequence.len() < 8));
+        let mut expected = peptides.clone();
+        expected.par_sort_unstable_by(|a, b| {
+            a.monoisotopic
+                .total_cmp(&b.monoisotopic)
+                .then_with(|| a.initial_sort(b))
+        });
+        let order = sorted_order(&peptides);
+        let got = order
+            .iter()
+            .map(|key| peptides[key.index as usize].clone())
+            .collect::<Vec<_>>();
+        assert!(got == expected);
     }
 
     #[test]
