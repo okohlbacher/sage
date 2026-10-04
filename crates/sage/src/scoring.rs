@@ -785,11 +785,11 @@ impl<'db> Scorer<'db> {
 
         // only the fragment-ion model (`ion_model`) uses the normalised HyperScore, and only
         // for spectra that kept their peak lists for it
-        let max_intensity = query
-            .ion_evidence
-            .is_some()
-            .then(|| query.intensities.iter().copied().fold(0.0f32, f32::max))
-            .unwrap_or(0.0);
+        let max_intensity = if query.ion_evidence.is_some() {
+            query.intensities.iter().copied().fold(0.0f32, f32::max)
+        } else {
+            0.0
+        };
 
         for idx in 0..report_psms.min(score_vector.len()) {
             let score = score_vector[idx].0;
