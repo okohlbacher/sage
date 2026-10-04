@@ -378,6 +378,7 @@ impl Parameters {
             MzBins::new(GUESS_LOW, heaviest + GUESS_MARGIN, max_bins),
             chunk_size,
             max_groups,
+            SCRATCH_SHARE,
         )
     }
 
@@ -505,6 +506,8 @@ const GUESS_LOW: f32 = 50.0;
 const GUESS_MARGIN: f32 = 200.0;
 /// Bins up to this size are sorted by comparison instead of by counting
 const SMALL_BIN: usize = 256;
+/// The bin sort's buffers take at most 1/`SCRATCH_SHARE` of the fragment index
+const SCRATCH_SHARE: usize = 32;
 
 /// Bins of the fragment m/z for [`binned_fragments`], in [`mz_key`] order: bin 0 holds
 /// every key below that of `lowest`, the last bin every key above that of `highest`
@@ -592,8 +595,8 @@ struct SortScratch {
 /// in them against the same bounds, and the minimum m/z of every page is the same).
 ///
 /// Memory: the final array (no second copy of the fragments), one count or write
-/// position per group and bin, and a scratch buffer per worker of the size of the
-/// largest bin it sorts.
+/// position per group and bin (freed before the bin sort), and the bin sort's buffers,
+/// at most 1/`scratch_share` of the final array (or one bin).
 fn binned_fragments<W, F, I>(
     n: usize,
     weight: W,
@@ -601,6 +604,7 @@ fn binned_fragments<W, F, I>(
     bins: MzBins,
     chunk_size: usize,
     max_groups: usize,
+    scratch_share: usize,
 ) -> Vec<Theoretical>
 where
     W: Fn(usize) -> usize + Sync,
@@ -659,20 +663,16 @@ where
     struct Out(*mut Theoretical);
     // SAFETY: shared only for writes to disjoint, bounds-checked elements (see below)
     unsafe impl Sync for Out {}
-    let out = Out(fragments.as_mut_ptr());
-    let (out, table, bounds) = (&out, &table, &bounds);
+    let out = &Out(fragments.as_mut_ptr());
     let filled = groups.par_iter().enumerate().all(|(g, range)| {
         // (next write position, end) of group g's range in every bin: the range ends
         // where that of the next group in the same bin starts
         let start = &table[g * nbins..(g + 1) * nbins];
-        let mut slots: Vec<(usize, usize)> = match table.get((g + 1) * nbins..(g + 2) * nbins) {
-            Some(end) => start.iter().copied().zip(end.iter().copied()).collect(),
-            None => start
-                .iter()
-                .copied()
-                .zip(bounds[1..].iter().copied())
-                .collect(),
-        };
+        let ends = table
+            .get((g + 1) * nbins..(g + 2) * nbins)
+            .unwrap_or(&bounds[1..]);
+        let mut slots: Vec<(usize, usize)> =
+            start.iter().copied().zip(ends.iter().copied()).collect();
         for ix in range.clone() {
             let peptide_index = PeptideIx(ix as u32);
             for mz in ions(ix) {
@@ -696,22 +696,44 @@ where
     // SAFETY: every range was filled completely (asserted above) and the ranges tile
     // `0..total`, so all `total` elements are initialised
     unsafe { fragments.set_len(total) };
+    drop(table);
 
-    // pass 3: order every bin (each arrived in item order)
+    // pass 3: order every bin (each arrived in item order). The counting sort of a bin
+    // works on a copy of it, so that at most `sorters` bins are sorted at a time, each
+    // sorter going through a contiguous run of bins with one buffer: the copies take
+    // at most 1/`scratch_share` of the index (one sorter per thread, as in the
+    // prototype, held 64 copies of the largest bins at 64 threads: +0.18 GiB peak RSS
+    // on human tryptic).
+    let largest = bounds.windows(2).map(|w| w[1] - w[0]).max().unwrap_or(0);
+    let sorters =
+        (total / scratch_share.max(1) / largest.max(1)).clamp(1, rayon::current_num_threads());
+    let per_run = total.div_ceil(sorters);
+    let mut runs: Vec<Vec<(usize, &mut [Theoretical])>> = Vec::with_capacity(sorters);
+    let (mut run, mut in_run) = (Vec::new(), 0);
     let mut rest = &mut fragments[..];
-    let mut todo = Vec::with_capacity(nbins);
     for b in 0..nbins {
         let (bin, tail) = std::mem::take(&mut rest).split_at_mut(bounds[b + 1] - bounds[b]);
         rest = tail;
+        in_run += bin.len();
         if bin.len() > 1 {
-            todo.push((b, bin));
+            run.push((b, bin));
+        }
+        if in_run >= per_run {
+            runs.push(std::mem::take(&mut run));
+            in_run = 0;
         }
     }
-    todo.into_par_iter()
-        .for_each_init(SortScratch::default, |scratch, (b, bin)| {
+    if !run.is_empty() {
+        runs.push(run);
+    }
+    debug_assert!(runs.len() <= sorters);
+    runs.into_par_iter().for_each(|run| {
+        let mut scratch = SortScratch::default();
+        for (b, bin) in run {
             let low_bits = (!bins.is_overflow(b)).then_some(bins.shift);
-            sort_bin(bin, low_bits, scratch);
-        });
+            sort_bin(bin, low_bits, &mut scratch);
+        }
+    });
     fragments
 }
 
@@ -778,6 +800,7 @@ fn sort_bin(bin: &mut [Theoretical], low_bits: Option<u32>, scratch: &mut SortSc
             }
             let items = &mut scratch.items;
             items.clear();
+            items.reserve_exact(bin.len());
             items.extend_from_slice(bin);
             for frag in items.iter() {
                 let c = &mut counts[(mz_key(frag.fragment_mz) & mask) as usize];
@@ -814,6 +837,7 @@ fn sort_by_peptide(page: &mut [Theoretical], bits: u32, scratch: &mut SortScratc
     counts.resize(1 << width, 0);
     let items = &mut scratch.items;
     items.clear();
+    items.reserve_exact(page.len());
     items.extend_from_slice(page);
     let (mut src, mut dst): (&mut [Theoretical], &mut [Theoretical]) = (&mut items[..], page);
     for pass in 0..passes {
@@ -1391,6 +1415,7 @@ mod test {
         max_bins: usize,
         chunk_size: usize,
         max_groups: usize,
+        scratch_share: usize,
     }
 
     impl quickcheck::Arbitrary for RandomFragments {
@@ -1429,6 +1454,8 @@ mod test {
                 max_bins: *g.choose(&[0, 1, 2, 3, 5, 64, 1000, 8192, 65536]).unwrap(),
                 chunk_size: 1 + usize::arbitrary(g) % 9,
                 max_groups: usize::arbitrary(g) % 10,
+                // 0 and 1: as many sorters as threads; usize::MAX: one
+                scratch_share: *g.choose(&[0, 1, 2, 32, usize::MAX]).unwrap(),
             }
         }
     }
@@ -1442,6 +1469,7 @@ mod test {
             max_bins,
             chunk_size,
             max_groups,
+            scratch_share,
         } = input;
         let expected: Vec<Theoretical> = items
             .iter()
@@ -1463,6 +1491,7 @@ mod test {
             bins,
             chunk_size,
             max_groups,
+            scratch_share,
         );
         // the order in which the m/z of one item arrive does not matter
         let reversed = binned_fragments(
@@ -1472,6 +1501,7 @@ mod test {
             bins,
             chunk_size,
             max_groups,
+            scratch_share,
         );
         bits(&got) == expected && bits(&reversed) == expected
     }
