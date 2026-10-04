@@ -60,7 +60,7 @@ pub struct ProcessedSpectrum {
     /// Total ion current
     pub total_ion_current: f32,
     /// All deisotoped MS2 peaks, for the fragment-ion model (if enabled)
-    pub ion_evidence: Option<IonEvidence>,
+    pub ion_evidence: Option<Box<IonEvidence>>,
 }
 
 static PROFILE_WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -571,7 +571,7 @@ impl SpectrumProcessor {
                     2 => {
                         let (masses, intensities, charges, evidence) =
                             self.process_ms2(self.deisotope, &spectrum);
-                        ion_evidence = evidence;
+                        ion_evidence = evidence.map(Box::new);
                         (masses, intensities, charges)
                     }
                     _ => {
@@ -610,6 +610,15 @@ impl SpectrumProcessor {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[test]
+    fn ion_evidence_costs_one_pointer_per_spectrum() {
+        // every spectrum carries the field, also with `ion_model` off
+        assert_eq!(
+            std::mem::size_of::<Option<Box<IonEvidence>>>(),
+            std::mem::size_of::<usize>()
+        );
+    }
 
     fn ms2(representation: Representation, mz: Vec<f32>, intensity: Vec<f32>) -> RawSpectrum {
         RawSpectrum {

@@ -580,7 +580,7 @@ pub fn annotate(
         let evidence = |spectrum: usize| {
             spectra[spectrum]
                 .ion_evidence
-                .as_ref()
+                .as_deref()
                 .expect("spectrum with evidence")
         };
 
@@ -944,7 +944,7 @@ mod test {
     fn evidence_keeps_all_deisotoped_peaks() {
         let (_, spectra, _) = small_search();
         for s in &spectra {
-            let ev = s.ion_evidence.as_ref().unwrap();
+            let ev = s.ion_evidence.as_deref().unwrap();
             assert!(ev.len() > s.masses.len(), "top 30 cut vs all peaks");
             assert!(s.masses.iter().all(|m| ev.masses.contains(m)));
         }
