@@ -64,7 +64,7 @@ pub struct Input {
     pub chimera: Option<bool>,
     pub wide_window: Option<bool>,
     pub min_peaks: Option<usize>,
-    pub max_peaks: Option<usize>,
+    pub max_peaks: Option<MaxPeaks>,
     pub max_fragment_charge: Option<u8>,
     pub min_matched_peaks: Option<u16>,
     pub precursor_charge: Option<(u8, u8)>,
@@ -84,6 +84,67 @@ pub struct Input {
     pub write_pin: Option<bool>,
     pub write_report: Option<bool>,
     pub score_type: Option<ScoreType>,
+}
+
+/// `max_peaks` as written in the configuration: a number of peaks, or `"auto"` (the default)
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub enum MaxPeaks {
+    /// Depends on the fragment tolerance: [`MaxPeaks::AUTO_PPM`] for ppm (and pct),
+    /// [`MaxPeaks::AUTO_DA`] for Da
+    #[default]
+    Auto,
+    Count(usize),
+}
+
+impl MaxPeaks {
+    /// Peaks kept per MS2 spectrum by `"auto"` with a ppm or pct fragment tolerance
+    /// (high-resolution fragment spectra)
+    pub const AUTO_PPM: usize = 400;
+    /// Peaks kept per MS2 spectrum by `"auto"` with a Da fragment tolerance (low-resolution
+    /// fragment spectra, e.g. ion trap CID at 0.5 Da)
+    pub const AUTO_DA: usize = 80;
+
+    /// The number of peaks to keep per MS2 spectrum
+    pub fn resolve(self, fragment_tol: &Tolerance) -> usize {
+        match (self, fragment_tol) {
+            (MaxPeaks::Count(n), _) => n,
+            (MaxPeaks::Auto, Tolerance::Ppm(..) | Tolerance::Pct(..)) => Self::AUTO_PPM,
+            (MaxPeaks::Auto, Tolerance::Da(..)) => Self::AUTO_DA,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for MaxPeaks {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visitor;
+        impl serde::de::Visitor<'_> for Visitor {
+            type Value = MaxPeaks;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a non-negative integer or \"auto\"")
+            }
+
+            fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<MaxPeaks, E> {
+                usize::try_from(v)
+                    .map(MaxPeaks::Count)
+                    .map_err(|_| E::invalid_value(serde::de::Unexpected::Unsigned(v), &self))
+            }
+
+            fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<MaxPeaks, E> {
+                u64::try_from(v)
+                    .map_err(|_| E::invalid_value(serde::de::Unexpected::Signed(v), &self))
+                    .and_then(|v| self.visit_u64(v))
+            }
+
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<MaxPeaks, E> {
+                match v {
+                    "auto" => Ok(MaxPeaks::Auto),
+                    _ => Err(E::invalid_value(serde::de::Unexpected::Str(v), &self)),
+                }
+            }
+        }
+        deserializer.deserialize_any(Visitor)
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -370,6 +431,20 @@ impl Input {
 
         let score_type = self.score_type.unwrap_or(ScoreType::SageHyperScore);
 
+        let max_peaks = self.max_peaks.unwrap_or_default();
+        let max_peaks_resolved = max_peaks.resolve(&self.fragment_tol);
+        if max_peaks == MaxPeaks::Auto {
+            log::info!(
+                "max_peaks: auto -> {} peaks per MS2 spectrum ({} fragment tolerance)",
+                max_peaks_resolved,
+                match self.fragment_tol {
+                    Tolerance::Ppm(..) => "ppm",
+                    Tolerance::Pct(..) => "pct",
+                    Tolerance::Da(..) => "Da",
+                }
+            );
+        }
+
         Ok(Search {
             version: clap::crate_version!().into(),
             database,
@@ -379,7 +454,7 @@ impl Input {
             precursor_tol: self.precursor_tol,
             fragment_tol: self.fragment_tol,
             report_psms: self.report_psms.unwrap_or(1),
-            max_peaks: self.max_peaks.unwrap_or(150),
+            max_peaks: max_peaks_resolved,
             min_peaks: self.min_peaks.unwrap_or(15),
             min_matched_peaks: self.min_matched_peaks.unwrap_or(4),
             max_fragment_charge: self.max_fragment_charge,
@@ -406,7 +481,88 @@ impl Input {
 #[cfg(test)]
 mod test {
 
-    use sage_core::{database::EnzymeBuilder, enzyme::EnzymeParameters};
+    use super::{Input, MaxPeaks};
+    use sage_core::{database::EnzymeBuilder, enzyme::EnzymeParameters, mass::Tolerance};
+
+    /// `max_peaks` of the resolved search parameters for a minimal configuration
+    fn resolved_max_peaks(
+        fragment_tol: serde_json::Value,
+        max_peaks: Option<serde_json::Value>,
+    ) -> anyhow::Result<usize> {
+        let mut config = serde_json::json!({
+            "database": { "fasta": "proteins.fasta" },
+            "precursor_tol": { "ppm": [-10.0, 10.0] },
+            "fragment_tol": fragment_tol,
+            // a URL is not resolved on disk (a local path must exist)
+            "mzml_paths": ["s3://bucket/spectra.mzML"],
+        });
+        if let Some(max_peaks) = max_peaks {
+            config["max_peaks"] = max_peaks;
+        }
+        let input: Input = serde_json::from_value(config)?;
+        Ok(input.build()?.max_peaks)
+    }
+
+    #[test]
+    fn max_peaks_auto_resolves_by_fragment_tolerance() -> anyhow::Result<()> {
+        use serde_json::json;
+        let ppm = json!({ "ppm": [-20.0, 20.0] });
+        let da = json!({ "da": [-0.5, 0.5] });
+        let pct = json!({ "pct": [-0.002, 0.002] });
+
+        // not set, null and "auto" are the same: 400 for ppm/pct, 80 for Da
+        for max_peaks in [None, Some(json!(null)), Some(json!("auto"))] {
+            assert_eq!(resolved_max_peaks(ppm.clone(), max_peaks.clone())?, 400);
+            assert_eq!(resolved_max_peaks(pct.clone(), max_peaks.clone())?, 400);
+            assert_eq!(resolved_max_peaks(da.clone(), max_peaks)?, 80);
+        }
+        // an explicit number is used as given, whatever the tolerance unit
+        for tol in [&ppm, &da, &pct] {
+            assert_eq!(resolved_max_peaks(tol.clone(), Some(json!(150)))?, 150);
+            assert_eq!(resolved_max_peaks(tol.clone(), Some(json!(0)))?, 0);
+        }
+
+        assert_eq!(MaxPeaks::default(), MaxPeaks::Auto);
+        assert_eq!(
+            MaxPeaks::Auto.resolve(&Tolerance::Ppm(-5.0, 5.0)),
+            MaxPeaks::AUTO_PPM
+        );
+        assert_eq!(
+            MaxPeaks::Auto.resolve(&Tolerance::Da(-0.02, 0.02)),
+            MaxPeaks::AUTO_DA
+        );
+        assert_eq!(MaxPeaks::Count(42).resolve(&Tolerance::Da(-0.5, 0.5)), 42);
+        Ok(())
+    }
+
+    #[test]
+    fn max_peaks_rejects_other_values() {
+        use serde_json::json;
+        for bad in [
+            json!(-1),
+            json!(1.5),
+            json!("Auto"),
+            json!("150"),
+            json!(true),
+            json!([150]),
+        ] {
+            let err = serde_json::from_value::<MaxPeaks>(bad.clone())
+                .expect_err(&format!("{bad} must be rejected"));
+            assert!(
+                err.to_string()
+                    .contains("a non-negative integer or \"auto\""),
+                "{bad}: {err}"
+            );
+        }
+        assert_eq!(
+            serde_json::from_value::<MaxPeaks>(json!(400)).unwrap(),
+            MaxPeaks::Count(400)
+        );
+        assert_eq!(
+            serde_json::from_value::<MaxPeaks>(json!("auto")).unwrap(),
+            MaxPeaks::Auto
+        );
+    }
 
     #[test]
     fn deserialize_enzyme_builder() -> Result<(), serde_json::Error> {
