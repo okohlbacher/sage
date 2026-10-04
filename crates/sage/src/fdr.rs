@@ -163,23 +163,24 @@ pub fn picked_protein(db: &IndexedDatabase, features: &mut [Feature]) -> usize {
     // Critical: All non-proteotypic, non-unique, or shared peptides are discarded
     // else the assumptions of picked protein FDR are invalid. Shared peptides are
     // still reported, albeit with protein FDR = 1.0
+    //
+    // The name of a side (`*_ix`) depends only on the key and the side, so it is formatted
+    // once per protein and side instead of once per feature (that serial formatting was
+    // most of this loop).
     let mut map: FnvHashMap<_, Competition<String>> = FnvHashMap::default();
     for feat in features
         .iter()
         .filter(|x| db[x.peptide_idx].proteins.len() == 1)
     {
-        let decoy = db[feat.peptide_idx].decoy;
-        let entry = map.entry(&db[feat.peptide_idx].proteins).or_default();
-        let proteins = db[feat.peptide_idx].proteins(&db.decoy_tag, db.generate_decoys);
-        match decoy {
-            true => {
-                entry.reverse = entry.reverse.max(feat.discriminant_score);
-                entry.reverse_ix = Some(proteins);
-            }
-            false => {
-                entry.forward = entry.forward.max(feat.discriminant_score);
-                entry.foward_ix = Some(proteins);
-            }
+        let peptide = &db[feat.peptide_idx];
+        let entry = map.entry(&peptide.proteins).or_default();
+        let (score, ix) = match peptide.decoy {
+            true => (&mut entry.reverse, &mut entry.reverse_ix),
+            false => (&mut entry.forward, &mut entry.foward_ix),
+        };
+        *score = score.max(feat.discriminant_score);
+        if ix.is_none() {
+            *ix = Some(peptide.proteins(&db.decoy_tag, db.generate_decoys));
         }
     }
 
@@ -200,22 +201,23 @@ pub fn picked_protein_group(db: &IndexedDatabase, features: &mut [Feature]) -> u
     // Critical: All non-proteotypic, non-unique, or shared peptides are discarded
     // else the assumptions of picked group FDR are invalid. Shared peptides are
     // still reported, albeit with protein group FDR = 1.0
-    let mut map: FnvHashMap<_, Competition<String>> = FnvHashMap::default();
+    //
+    // The key is borrowed (it hashes like the owned string, so the map is laid out as
+    // before) and a side's name, equal to the key, is copied once per group and side
+    // instead of twice per feature.
+    let mut map: FnvHashMap<&Option<String>, Competition<String>> = FnvHashMap::default();
     for feat in features
         .iter()
         .filter(|x| x.num_protein_groups == 1 && x.protein_groups.is_some())
     {
-        let decoy = db[feat.peptide_idx].decoy;
-        let entry = map.entry(feat.protein_groups.clone()).or_default();
-        match decoy {
-            true => {
-                entry.reverse = entry.reverse.max(feat.discriminant_score);
-                entry.reverse_ix = feat.protein_groups.clone();
-            }
-            false => {
-                entry.forward = entry.forward.max(feat.discriminant_score);
-                entry.foward_ix = feat.protein_groups.clone();
-            }
+        let entry = map.entry(&feat.protein_groups).or_default();
+        let (score, ix) = match db[feat.peptide_idx].decoy {
+            true => (&mut entry.reverse, &mut entry.reverse_ix),
+            false => (&mut entry.forward, &mut entry.foward_ix),
+        };
+        *score = score.max(feat.discriminant_score);
+        if ix.is_none() {
+            *ix = feat.protein_groups.clone();
         }
     }
 
@@ -225,8 +227,7 @@ pub fn picked_protein_group(db: &IndexedDatabase, features: &mut [Feature]) -> u
         .par_iter_mut()
         .filter(|x| x.num_protein_groups == 1 && x.protein_groups.is_some())
         .for_each(|feat| {
-            let protein_groups = feat.protein_groups.as_deref().unwrap().to_string();
-            feat.protein_group_q = scores[&protein_groups];
+            feat.protein_group_q = scores[feat.protein_groups.as_deref().unwrap()];
         });
 
     passing
