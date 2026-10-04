@@ -28,6 +28,34 @@ use report_builder::{
 /// Processed (MS1, MSn) spectra of one batch of files
 type Spectra = (Vec<ProcessedSpectrum>, Vec<ProcessedSpectrum>);
 
+/// `Parameters::build`, with the memory that the digest step freed handed back to the
+/// OS before the fragment index is allocated. Sage's global allocator is mimalloc
+/// (main.rs), and mimalloc v3 keeps freed memory committed for up to 1 s
+/// (`purge_delay`): the digests, digest groups, target set and transient peptide
+/// vectors (1-2 GB for a three-species database) would otherwise still be resident
+/// when the 2.4 GB fragment array and the spectra of the overlapped read are.
+fn build_database(parameters: Parameters, fasta: Fasta) -> IndexedDatabase {
+    let peptides = parameters.digest(&fasta);
+    drop(fasta);
+    release_freed_memory();
+    parameters.build_from_peptides(peptides)
+}
+
+/// Purge memory that the allocator holds freed but committed (mimalloc `mi_collect`,
+/// forced). In mimalloc v3 this collects the calling thread's heap and purges the
+/// process-wide arenas of the memory already returned to them; pages that other threads
+/// still hold in their own heaps are not covered.
+fn release_freed_memory() {
+    // links the mimalloc library (`libmimalloc-sys`) into every target of this crate,
+    // not only into the binary that makes it the global allocator
+    use mimalloc as _;
+    extern "C" {
+        fn mi_collect(force: bool);
+    }
+    // SAFETY: `mi_collect` takes no pointers and only returns free memory to the OS.
+    unsafe { mi_collect(true) }
+}
+
 pub struct Runner {
     pub database: IndexedDatabase,
     pub parameters: Search,
@@ -86,6 +114,9 @@ impl Runner {
                         },
                         || {
                             let peptides = db_params.digest(&fasta);
+                            // as in `build_database`
+                            drop(fasta);
+                            release_freed_memory();
                             db_params.build_pruned_when_ready(peptides, |probe| {
                                 // not read yet, or failed (reported below)
                                 let spectra: &Spectra = read.get()?.as_ref().ok()?;
@@ -101,13 +132,12 @@ impl Runner {
                             })
                         },
                     );
-                    drop(fasta);
                     first_batch = Some(read.into_inner().expect("the read has finished")?);
                     database
                 } else {
                     // Later batches are read after the index is built: index everything
                     let (database, spectra) = rayon::join(
-                        || parameters.database.clone().build(fasta),
+                        || build_database(parameters.database.clone(), fasta),
                         || reader.read_processed_spectra(batch, 0, parallel),
                     );
                     first_batch = Some(spectra?);
@@ -119,7 +149,7 @@ impl Runner {
                     .database
                     .auto_calculate_prefilter_chunk_size(&fasta);
                 if parameters.database.prefilter_chunk_size >= fasta.targets.len() {
-                    parameters.database.clone().build(fasta)
+                    build_database(parameters.database.clone(), fasta)
                 } else {
                     info!(
                         "using {} db chunks of size {}",
