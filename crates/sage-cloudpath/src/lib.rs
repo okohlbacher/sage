@@ -44,7 +44,7 @@ pub fn to_url(s: &str) -> Result<Url, Error> {
 }
 
 /// Does the URL path end in "gz" or "gzip"?
-fn gzip_heuristic(url: &Url) -> bool {
+pub(crate) fn gzip_heuristic(url: &Url) -> bool {
     // case-insensitive, like format detection (`run.mzML.GZ` was read as raw XML)
     let p = url.path().to_ascii_lowercase();
     p.ends_with("gz") || p.ends_with("gzip")
@@ -82,15 +82,25 @@ fn parse_url(url: &Url) -> Result<(Box<dyn ObjectStore>, object_store::path::Pat
     .map_err(Error::ObjectStore)
 }
 
+/// Read size for local files. object_store streams a local file in 8 KiB chunks, each read
+/// by its own task on tokio's blocking pool (134,000 thread hand-offs for a 1.1 GB mzML);
+/// with 2 MiB reads the serial mzML parse is 20-50% faster (same bytes).
+const LOCAL_READ_SIZE: usize = 2 << 20;
+
 /// Open a streaming reader for the given URL.
 async fn read_url(url: &Url) -> Result<Box<dyn AsyncBufRead + Unpin + Send>, Error> {
-    let (store, obj_path) = parse_url(url)?;
-    let result = store.get(&obj_path).await.map_err(Error::ObjectStore)?;
-    let stream = result
-        .into_stream()
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e));
-    let reader: BufReader<Box<dyn AsyncRead + Unpin + Send>> =
-        BufReader::new(Box::new(tokio_util::io::StreamReader::new(stream)));
+    let reader: BufReader<Box<dyn AsyncRead + Unpin + Send>> = if url.scheme() == "file" {
+        let path = url.to_file_path().map_err(|_| Error::InvalidUri)?;
+        let file = tokio::fs::File::open(path).await?;
+        BufReader::with_capacity(LOCAL_READ_SIZE, Box::new(file))
+    } else {
+        let (store, obj_path) = parse_url(url)?;
+        let result = store.get(&obj_path).await.map_err(Error::ObjectStore)?;
+        let stream = result
+            .into_stream()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e));
+        BufReader::new(Box::new(tokio_util::io::StreamReader::new(stream)))
+    };
 
     if gzip_heuristic(url) {
         // a gzip file may consist of several members (e.g. concatenated or
