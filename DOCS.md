@@ -230,13 +230,13 @@ For additional information about configuration options and output file formats, 
   "wide_window": false,     // Optional[bool] {default=false}: _ignore_ `precursor_tol` and search in wide-window/DIA mode
   "predict_rt": false,    // Optional[bool] {default=true}: use retention time prediction model as an feature for LDA
   "min_peaks": 15,          // Optional[int] {default=15}: only process MS2 spectra with at least N peaks
-  "max_peaks": "auto",      // Optional[int | "auto"] {default="auto"}: take the top N most intense MS2 peaks to search;
-                            // "auto" = 80 for a Da `fragment_tol` reaching 0.1 Da (150 with TMT at MS2), else 400
+  "max_peaks": 150,         // Optional[int | "auto"] {default=150}: take the top N most intense MS2 peaks to search;
+                            // "auto" = 400 for ppm, 80 for a Da `fragment_tol` reaching 0.1 Da (see below)
   "min_matched_peaks": 6,   // Optional[int] {default=4}: minimum # of matched b+y ions to use for reporting PSMs
   "max_fragment_charge": 1, // Optional[int] {default=null}: maximum fragment ion charge states to consider,
   "report_psms": 1,         // Optional[int] {default=1}: number of PSMs to report for each spectra. Higher values might disrupt PSM rescoring.
-  "ion_model": false,       // Optional[bool] {default=false}: self-trained, cross-fitted fragment-ion model; adds the
-                            // `ion_llr` and `ion_explained` columns to the results and the PIN file (for Percolator/mokapot)
+  "ion_model": false,       // Optional[bool] {default=false}: experimental self-trained, cross-fitted fragment-ion model;
+                            // adds the `ion_llr` and `ion_explained` columns to the results and the PIN file (for Percolator/mokapot)
   "output_directory": "s3://bucket/prefix" // Optional[str] {default=`.`}: Place output files in a given directory or S3 bucket/prefix
   "mzml_paths": [           // List[str]: representing paths to mzML (or gzipped-mzML) files for search
     "local/path.mzML",
@@ -266,6 +266,9 @@ This documentation covers the parameters in the JSON configuration file for the 
 ## Database
 
 - **bucket_size**: Integer. The number of fragments in each internal mass bucket (default: 8192). Tweaking this parameter can increase search performance for wide precursor or fragment searches.
+- **prefilter**: Boolean. Build the database in chunks of the FASTA file, search all spectra against each chunk, keep only the peptides that rank among the best candidates of some spectrum, and build the final fragment index from those peptides (default: false). Meant for databases whose full fragment index does not fit into memory; see [Memory, speed and the fragment index](#memory-speed-and-the-fragment-index).
+- **prefilter_chunk_size**: Integer. Number of FASTA proteins per prefilter chunk (default: 0 = chosen so that a chunk holds about 8.4 million peptides, estimated from the unmodified digest and the variable modifications).
+- **prefilter_low_memory**: Boolean. Keep only the best `report_psms` + 1 fully scored candidates of each spectrum (true), or every candidate of the preliminary search (false: a larger final index) (default: true).
 
 ### Enzyme
 
@@ -435,28 +438,38 @@ Note on the settings below:
 - **wide_window**: Boolean. Ignore `precursor_tol` and search spectra in wide-window/dynamic precursor tolerance mode (default: false).
 - **predict_rt**: Boolean. Use retention time prediction model as a feature for LDA (default: true).
 - **min_peaks**: Integer. Only process MS2 spectra with at least N peaks (default: 15).
-- **max_peaks**: Integer or `"auto"`. Take the top N most intense MS2 peaks (after deisotoping) to search (default: `"auto"`).
-  `"auto"` keeps 80 peaks when `fragment_tol` is given in Da and reaches at least 0.1 Da on one side (low-resolution
-  fragment spectra, e.g. ion trap CID searched at 0.5 Da), and 400 peaks otherwise (a ppm or pct tolerance, or a narrow
-  Da tolerance such as 0.02 Da). With TMT quantification at MS2 (`quant.tmt_settings.level` 2) and a Da tolerance
-  reaching 0.1 Da, `"auto"` keeps 150 peaks, because the reporter ions are read from the capped spectrum and 80 peaks
-  drop some of them. High-resolution spectra carry real fragment ions well below the 150th most intense peak; at a
-  wide Da tolerance, low-intensity peaks mostly add chance matches. On the 20 public files of the OpenMS benchmark
-  (OpenMS#10364, Percolator, 1% FDR) `"auto"` finds 2.3% more PSMs than the former fixed default of 150
-  (Astral +10.8%), at a lower doubled-database entrapment FDP (1.08% -> 1.03%), and Sage's own q-values find 2.2% more.
-  `"auto"` goes by the unit of `fragment_tol` only: it assumes that a Da tolerance of 0.1 Da or more means
-  low-resolution fragment spectra and that a ppm or pct tolerance means high-resolution ones; for other cases (e.g.
-  low-resolution data searched with a ppm tolerance) set a number. Time: scoring more peaks makes the search phase
-  about 35-80% longer on high-resolution data (Astral, timsTOF, Exploris; 0.5 Da searches score fewer peaks and get
-  faster). On the 8,000-spectrum benchmark files at 4 threads, where building the index takes most of the run, the
-  total stayed about the same (high-resolution files 0-7% longer); one complete Astral run (122,659 MS2 spectra) took
-  13% longer at 4 threads and 5.5% at 16, with 0.3-0.65 GiB more peak memory (measured on a loaded node, indicative).
-  The resolved number is logged and written to `results.json`; an explicit number is used as given
-  (`max_peaks: 150` reproduces the results and the speed of earlier versions).
+- **max_peaks**: Integer or `"auto"`. Take the top N most intense MS2 peaks (after deisotoping) to search (default: 150). With a number below `min_peaks`, no MS2 spectrum can be searched; Sage logs a warning.
+
+  `"auto"` (opt-in) chooses the number from `fragment_tol`:
+  - 400 peaks for a ppm or pct tolerance, or a Da tolerance narrower than 0.1 Da (e.g. 0.02 Da). High-resolution spectra carry real fragment ions well below the 150th most intense peak.
+  - 80 peaks for a Da tolerance that reaches at least 0.1 Da on one side (low-resolution fragment spectra, e.g. ion trap CID searched at 0.5 Da). At a wide tolerance, low-intensity peaks mostly add chance matches. With TMT quantification at MS2 (`quant.tmt_settings.level` 2) it keeps 150 instead, because the reporter ions are read from the capped spectrum and 80 peaks drop some of them.
+  - 150 with `wide_window: true`, whatever the tolerance. In wide-window and DIA-style searches, 400 peaks let wrong candidates from the wide isolation window win more often. On HF-X, timsTOF and Astral files of the benchmark below, Percolator found 3-46% fewer PSMs with 400 peaks than with 150 (Astral -46%). On a public diaPASEF run (PXD017703), it found 12-16% fewer, and the run took 1.9x as long.
+  - Never fewer than `min_peaks`: a smaller number is raised to `min_peaks`.
+
+  The resolved number is logged (e.g. `max_peaks: auto -> 400 peaks per MS2 spectrum (...)`) and written to `results.json`. `"auto"` goes by the unit of `fragment_tol` only. It assumes that a Da tolerance of 0.1 Da or more means low-resolution fragment spectra and that a ppm or pct tolerance means high-resolution ones. For other cases (e.g. low-resolution data searched with a ppm tolerance), set a number.
+
+  Measured on the public benchmark of OpenMS issue #10364 (8,000 MS2 spectra from each of 20 public runs) and on a held-out set (another 8,000 spectra from each of the same runs), with Percolator 3.09, 20 seeds and target PSMs at 1% FDR, against `max_peaks: 150`:
+
+  | | 20 benchmark files | held-out spectra |
+  |---|---|---|
+  | PSMs per file | +2.26% (Astral +10.8%, Lumos LFQ -0.1%) | +2.38% (Astral +7.7%, Lumos LFQ +0.4%) |
+  | doubled-database entrapment FDP (three shuffles) | 1.08% -> 1.03% | 1.00% -> 1.07% |
+  | Velos UPS1 entrapment FDP | 1.20% -> 1.25% | 1.06% -> 0.95% |
+
+  On the held-out set, the doubled-database FDP rose by 0.070 points, above the pre-registered limit of +0.05 for a default change, so `"auto"` stayed opt-in. The excess is about 1.5 standard errors and is not significant, and the two sets disagree in sign. Sage's own q-values found 2.2% more PSMs on the benchmark files.
+
+  Cost, measured against `max_peaks: 150` (AMD EPYC 7763, paired runs):
+  - Time: the search phase scores more peaks. On Astral spectra it takes 70-80% longer (0.46-0.48 -> 0.82-0.84 s per 8,000 spectra at 4 threads); on 0.5 Da data at 80 peaks it is shorter.
+    - The 20 benchmark files at 4 threads took about the same total time (+0.2%; high-resolution files -1.4% to +7.7%, 0.5 Da files -3.4% to -7.0%), because building the fragment index takes most of these runs.
+    - Larger inputs show more of it: 24,000 Astral spectra took 11.7%, 10.2% and 7.4% longer at 4, 16 and 64 threads, and 24,000 Velos spectra (80 peaks) took 11.0%, 8.6% and 10.5% less.
+  - Memory: the extra peaks (9 bytes each) are kept for every MS2 spectrum of a batch until the batch has been searched.
+    - That is about +0.30 GiB per full-size Astral run (about 120,000 MS2 spectra) in the batch, and +0.50 GiB with `report_psms` 10. This was measured with three and six such runs in one batch; it grows linearly with the number of files.
+    - By default a batch holds CPUs/2 files (`--batch-size`), so on a large machine it holds all files of a run. `--batch-size` or `max_peaks: 150` bounds the extra memory.
+    - A single gzipped file shows little of it (+0.12 GiB), because there the read and the index build set the peak.
 - **min_matched_peaks**: Integer. The minimum number of matched b+y ions to use for reporting PSMs (default: 4).
 - **max_fragment_charge**: Integer. The maximum fragment ion charge states to consider (default: null - use precursor z-1).
 - **report_psms**: Integer. The number of PSMs to report for each spectrum. Higher values might disrupt LDA (default: 1).
-- **ion_model**: Boolean. Learn a fragment-ion likelihood model from each file's own confident PSMs and report two extra features per PSM, `ion_llr` and `ion_explained`, in results.sage.tsv (or results.sage.parquet) and in the PIN file (default: false). They are meant for a rescorer such as Percolator or mokapot; Sage's own LDA does not use them. See [Fragment-ion model](#fragment-ion-model-ion_model).
+- **ion_model**: Boolean. Learn a fragment-ion likelihood model from each file's own confident PSMs and report two extra features per PSM, `ion_llr` and `ion_explained`, in results.sage.tsv (or results.sage.parquet) and in the PIN file (default: false). They are meant for a rescorer such as Percolator or mokapot; Sage's own LDA does not use them. Experimental: its error control was not confirmed on held-out data, so it is not recommended for routine use. See [Fragment-ion model](#fragment-ion-model-ion_model).
 - **parallel**: Boolean. Parse and search files in parallel. For large numbers of files or low RAM, setting this to false can reduce memory usage at the cost of running slower (default: true).
 
 ## mzML Paths
@@ -469,7 +482,12 @@ Note on the settings below:
       "s3://my-mass-spec-data/PXD0000001/foo.mzML.gz"
     ]
     ```
-  - Local, uncompressed mzML files are parsed in parallel, in chunks of whole spectra (the spectra are the same as with the serial parse). Gzipped and remote files, and files with comments, CDATA sections or processing instructions between the spectra or another unusual layout, are parsed serially. Setting the environment variable `SAGE_MZML_SERIAL=1` forces the serial parse.
+  - Local, uncompressed mzML files are parsed in parallel, in chunks of whole spectra (the spectra are the same as with the serial parse).
+    - Gzipped and remote files, and files with comments, CDATA sections or processing instructions between the spectra or another unusual layout, are parsed serially. They are read completely (all raw spectra of a file) before their spectra are processed.
+    - Setting the environment variable `SAGE_MZML_SERIAL` to any value except `0` (e.g. `SAGE_MZML_SERIAL=1`) forces the serial parse. Why a file is parsed serially is logged at debug level (`SAGE_LOG=sage_cloudpath=debug`).
+    - Speed: on 72,000 Astral spectra (AMD EPYC 7763), the parallel parse alone made a run 1.42x faster at 16 threads and 1.6x faster at 64-128. On 8,000-spectrum files it is about neutral.
+    - The parallel parse holds only the chunks being parsed in memory. It reads every file twice: first a scan for the spectrum boundaries, then the chunks. The second read normally comes from the page cache.
+    - If the files of a batch (all files read together, by default CPUs/2 of them) do not fit into free memory, the second read goes to the storage again. On storage slower than about 300 MB/s (a hard disk, a 1 GbE network share), the parallel parse can then be slower than the serial one; set `SAGE_MZML_SERIAL=1` or a smaller `--batch-size` there. On local NVMe and on Ceph storage, it stayed 3.3-4.5x faster than the serial parse even when the file was read twice.
   
 ## Output directory:
 
@@ -479,6 +497,21 @@ Note on the settings below:
   ```json
   "output_directory": "s3://my-mass-spec-results/PXD003881/"
   ```
+
+## Memory, speed and the fragment index
+
+- **Batches**: `--batch-size` files (default: CPUs/2) are read and searched together, and the processed spectra of all files of a batch stay in memory until the batch has been searched. On a large machine that is usually every file of a run. A smaller `--batch-size` lowers the peak memory of runs with many large files. That matters most with `max_peaks: "auto"` and `ion_model`, which keep more data per MS2 spectrum.
+- **Pruned fragment index**: when every input file is read in the first batch and `database.prefilter` is off, the fragment index holds only the fragments of peptides that some precursor window of those spectra can reach. On the benchmark of OpenMS issue #10364, that drops 35-64% of the fragments.
+  - The peptide list stays complete, and the results are the same as with the full index.
+  - The build does not wait for the spectra. It prunes at the first of three points at which all spectra have been read: before counting the fragments, after counting them, or before bucketing them. Each step logs what it did.
+  - The full index is built if the read is still going after the last point. That happens often with gzipped, remote or otherwise serially parsed files at high thread counts. The full index is also built when the files need more than one batch, and in prefilter mode.
+  - The telemetry record's `fragments` field reports the number of fragments in the index, i.e. the pruned count.
+- **Prefilter mode** (`database.prefilter: true`) is meant for databases whose full fragment index does not fit into memory. It searches the spectra against the database chunk by chunk (see [Database](#database)) and builds the final index from the peptides it keeps.
+  - The fragment index of each chunk is returned to the operating system before the next chunk is digested.
+  - On two of the benchmark files (Velos and Astral) at 64 threads, prefilter mode was 1.8x faster than v0.15.0-fork.2 and peaked 0.24-0.42 GiB lower.
+- **Allocator**: Sage uses mimalloc, which keeps freed memory for a while before returning it to the operating system. Sage asks it to return freed memory before the peptide sort and before the fragment index is allocated.
+  - With several gzipped files in one batch at 64-128 threads, where the index is often not pruned before it is allocated, peak memory occasionally rose about 1 GiB above that of earlier versions. Since the second release point was added, this did not happen in 100 benchmark runs, but it did in one of 22 profiled runs.
+  - `MIMALLOC_ARENA_EAGER_COMMIT=0` makes mimalloc commit memory as it is used, which lowers peak memory at high thread counts at some cost in speed.
 
 # Interpreting Sage Output
 
@@ -526,13 +559,34 @@ These columns provide comprehensive information about each candidate peptide spe
 
 ## Fragment-ion model (`ion_model`)
 
-With `"ion_model": true`, Sage learns, for every input file, how the fragment ions of confidently identified peptides show up in that file's spectra, and scores every PSM against it:
+With `"ion_model": true`, Sage learns, for every input file, how the fragment ions of confidently identified peptides show up in that file's spectra, and scores every PSM against it. In short: a PSM whose b/y ions are found (or missing) the way they are for correct peptides gets a high `ion_llr`, one whose ions look like those of reversed sequences a low one, and each PSM is scored by a model trained on the other half of the file's spectra. The option is experimental and off by default. Its two features are only useful with a rescorer (Percolator, mokapot), because Sage's LDA does not use them. Details:
 
 - **Evidence**: all deisotoped peaks of the MS2 spectrum (not only the `max_peaks` most intense ones), with their intensity rank.
-- **Contexts and outcomes**: each theoretical b/y ion (fragment charge 1, and also 2 for precursor charge >= 3) has a context (ion series, precursor charge 2 / 3 / >= 4, fragment charge, position along the peptide in tenths, cleavage N-terminal to proline or C-terminal to D/E, complementary ion found or not) and an outcome (not found, or found at one of 7 intensity rank bins (1-2, 3-5, 6-10, 11-20, 21-40, 41-80, > 80) x 3 mass error bins (< 1/4, < 1/2, <= 1 of the fragment tolerance); the nearest peak counts).
+- **Contexts and outcomes**: each theoretical b/y ion (fragment charge 1, and also 2 for precursor charge >= 3) has a context (ion series, precursor charge 2 / 3 / >= 4, fragment charge, position along the peptide in tenths, cleavage N-terminal to proline or C-terminal to D/E, complementary ion found or not) and an outcome (not found, or found at one of 7 intensity rank bins (1-2, 3-5, 6-10, 11-20, 21-40, 41-80, > 80) x 3 mass error bins (< 1/4, < 1/2, <= 1 of the window's half-width); the nearest peak counts).
+  - The window is centred on the theoretical m/z, with half the total width of `fragment_tol` on each side: ±(hi - lo)/2. For a symmetric tolerance this is Sage's own matching window.
+  - For an asymmetric `fragment_tol` it differs from Sage's windows, which themselves differ between the preliminary search and the rescoring. That is deliberate. On the benchmark, following the rescoring window instead lost 1.7% of the PSMs with ppm(-10, 30) and 28% with Da(-0.5, 0) when the peaks were centred near 0. It gained nothing measurable where the asymmetry matched a real mass offset.
 - **Training**: rank-1 target PSMs at 1% FDR of a label-free target-decoy competition on the HyperScore computed with intensities normalised to the spectrum's most intense peak, separately for precursor charge <= 2 and >= 3. A *signal* table counts the outcomes of the identified peptides, a *noise* table those of the same peptides reversed except for the C-terminal residue, matched against the same spectra. Both are smoothed by back-off over coarser contexts (pseudo-count 20).
 - **Features**: `ion_llr` = sum over the ions of log P(outcome | signal) - log P(outcome | noise); `ion_explained` = share of the ions the signal model expects to be found that were found (weighted by that probability).
-- **Cross-fitting**: the spectra of a file are split into two folds by the parity of their index (among the spectra with PSMs, in file order). Each fold trains a model, and every PSM is scored by the model of the other fold, so no PSM is scored by a model trained on it. If a fold has fewer than 100 training PSMs, or the file has no decoy PSMs, the file's features are 0 (a warning is logged).
-- **Cost**: the cost grows with the number of MS2 spectra and peaks. The peak lists take about 5 bytes per deisotoped peak of every MS2 spectrum of a batch of files while it is searched (about 40 MB for 8,000 Astral spectra, about 0.35 GB for 72,000). Building them while the files are read and training and applying the model took about 15-25 µs per MS2 spectrum at 4 threads (`report_psms` 10). On the 20 benchmark files, which are 8,000-spectrum slices whose search time is dominated by building the fragment index, that made a search at 4 threads about 2% longer (median per file; 0.8-4.7%) at about the same peak memory (+0.03 GiB median, of 3.5-4.5 GiB); full-size runs were not measured; there the index takes a smaller share of the time, so the option's share is expected to be larger.
+- **Cross-fitting**: the spectra of a file are split into two folds by the parity of their index (among the spectra with PSMs, in file order). Each fold trains a model, and every PSM is scored by the model of the other fold, so no PSM is scored by a model trained on it.
+  - The folds are assigned per spectrum, not per peptide. A peptide identified in spectra of both folds is therefore scored partly by a model trained on its other observations. On the held-out data, 7% of the rank-1 target PSMs are in that situation. Leaving such peptides out of the other fold's training changed the yield by +0.06% and the doubled-database FDP by +0.008 points, so no measurable effect.
+  - A file gets features only if both folds have at least 100 training PSMs and the file has a rank-1 decoy PSM. Otherwise every PSM of the file gets 0, and a warning is logged. The gate is per file, as in ProSE: one bit per file, the same for targets and decoys. All 40 benchmark and held-out files were trained, with at least a 4x margin.
+- **Cost**: time and memory grow with the number of MS2 spectra and peaks.
+  - Time: building the peak lists while the files are read, then training and applying the model, took about 15-25 µs per MS2 spectrum at 4 threads (`report_psms` 10). On the release build, that was +2.4% wall time on the 20 benchmark files at 4 threads (per file +0.1% to +4.4%), and +2.5% / +4.5% on 24,000 Astral spectra at 16 / 64 threads.
+  - Memory: the peak lists take about 5 bytes per deisotoped peak (about 4.5 KB per Astral MS2 spectrum). They are kept for every MS2 spectrum of a batch until the batch has been searched, about 40 MB per 8,000 Astral spectra and 0.35 GiB per 72,000.
+    - Peak memory rose by 0.13 GiB on 24,000 Astral spectra.
+    - A batch of twelve 72,000-spectrum Astral files peaked at 28.5 instead of 24.4 GiB.
+    - By default a batch holds CPUs/2 files; a smaller `--batch-size` bounds the extra memory.
 
-On the 20 public files of OpenMS issue #10364 (Percolator 3.09, 20 seeds, `max_peaks` 150), the two columns raise PSMs at 1% FDR by 5.2% on average (Astral +24%, Velos +5.1%, HF-X +4.6%, TMT +3.4-3.6%, Lumos LFQ and timsTOF +0.2-0.3%); the doubled-database entrapment FDP stays at 1.08-1.09% (pooled over three shuffles). All other columns are the same with and without the option, and the output does not depend on the number of threads.
+Measured on the public benchmark of OpenMS issue #10364 (8,000 MS2 spectra from each of 20 public runs) and on a held-out set (another 8,000 spectra from each of the same runs), with Percolator 3.09, 20 seeds, target PSMs at 1% FDR and `max_peaks` 150:
+
+| | 20 benchmark files | held-out spectra |
+|---|---|---|
+| PSMs per file | +5.2% (Astral +24%, Velos +5.1%, HF-X +4.6%, TMT +3.4-3.6%, Lumos LFQ and timsTOF +0.2-0.3%) | +5.5% (Astral +25%) |
+| doubled-database entrapment FDP (three shuffles) | 1.08% -> 1.09% | 1.00% -> 1.03% |
+| Velos UPS1 entrapment FDP | 1.20% -> 1.27% | 1.06% -> 1.30% |
+
+- On the held-out set, the Velos UPS1 FDP rose in all three Velos files and in all 20 seeds, above the pre-registered limit of 1.16%.
+- With `max_peaks: "auto"`, the gain was +6.4% (benchmark) and +6.0% (held-out). But the held-out doubled-database FDP rose by 0.077 points, above the limit of +0.05.
+- The error control of the two features is therefore not confirmed. The option stays experimental and is not recommended for routine use.
+
+All other columns are the same with and without the option, and the output does not depend on the number of threads.
