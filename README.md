@@ -7,6 +7,32 @@
 
 For more information please read [the online documentation!](https://sage-docs.vercel.app/docs)
 
+## About this fork
+
+This is [okohlbacher/sage](https://github.com/okohlbacher/sage), a performance and correctness fork of [lazear/sage](https://github.com/lazear/sage) by Michael Lazear and contributors, based on upstream 0.15.0-beta.2 (master 2c9922e). It adds:
+
+- **Speed with identical results**: same identifications, byte-identical result and PIN files.
+- **Input**: faster Bruker `.d` (ddaPASEF) reading, optional mzPeak input (`--features mzpeak`) and parallel mzML parsing.
+- **Opt-in quality features**: `max_peaks: "auto"` and the experimental `ion_model`; the defaults are unchanged. See [DOCS.md](DOCS.md).
+- **Fixes** for silent data loss, crashes and wrong output.
+
+Binaries for Linux, macOS and Windows (default and mzPeak variants) are on the [releases page](https://github.com/okohlbacher/sage/releases). Every change is listed in the [CHANGELOG](CHANGELOG.md). If you use Sage, please cite the original paper (see [Citation](#citation)).
+
+v0.15.0-fork.3 against v0.15.0-fork.2, on the public benchmark of [OpenMS issue #10364](https://github.com/OpenMS/OpenMS/issues/10364) (8,000 MS2 spectra from each of 20 public runs):
+
+| Input | Threads | fork.2 | fork.3 | Speed-up | Peak memory fork.2 -> fork.3 |
+|---|---:|---:|---:|---:|---|
+| 20 files, sum | 4 | 220.8 s | 131.0 s | 1.69x | 3.3-4.5 -> 2.6-3.7 GiB per file |
+| 4 files (Velos, HF-X, Astral, timsTOF), sum | 1 | 129.6 s | 80.7 s | 1.61x | 3.2-4.4 -> 2.5-3.2 GiB |
+| | 16 | 21.9 s | 10.4 s | 2.10x | 3.7-5.4 -> 2.9-4.1 GiB |
+| | 64 | 18.5 s | 7.5 s | 2.45x | 4.3-5.6 -> 3.4-4.3 GiB |
+| | 128 | 18.6 s | 8.1 s | 2.29x | 4.7-5.5 -> 3.6-4.3 GiB |
+| 72,000 Astral spectra (the 3 Astral files, 3 times over) | 4 | 22.7 s | 17.6 s | 1.29x | 5.6 -> 4.5 GiB |
+| | 16 | 13.7 s | 6.5 s | 2.09x | 5.7 -> 4.8 GiB |
+| | 64 | 12.5 s | 3.9 s | 3.15x | 6.0 -> 5.4 GiB |
+
+Protocol: AMD EPYC 7763 (64 cores, 128 threads), idle, warm page cache; the issue's search configuration with `max_peaks` 150; fork.2 and fork.3 alternate in paired ABBA blocks (medians of 2 repetitions); the result and PIN files are byte-identical in every pair.
+
 
 # Introduction
  
