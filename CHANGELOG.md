@@ -6,6 +6,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v0.15.0-fork.4] - 2026-10-05
+
+### Changed
+- Telemetry is off by default. Sage sends its anonymous usage record (version, run time, OS, memory, CPU count, database size, LFQ/TMT/parquet use) to the upstream developers only with the new flag `--enable-telemetry`. `--disable-telemetry-i-dont-want-to-improve-sage` is still accepted; it has no effect on its own and wins if both flags are given.
+- The crates are versioned 0.15.0-fork.4. Search results are unchanged from fork.3.
+
 ## [v0.15.0-fork.3] - 2026-10-05
 
 Faster, with the same results: with the same settings, every result and PIN file in the benchmark runs below is byte-identical to fork.2's. The defaults are unchanged. `max_peaks` stays 150, and the two new quality options are opt-in.

@@ -15,6 +15,7 @@ This is [okohlbacher/sage](https://github.com/okohlbacher/sage), a performance a
 - **Input**: faster Bruker `.d` (ddaPASEF) reading, optional mzPeak input (`--features mzpeak`) and parallel mzML parsing.
 - **Opt-in quality features**: `max_peaks: "auto"` and the experimental `ion_model`; the defaults are unchanged. See [DOCS.md](DOCS.md).
 - **Fixes** for silent data loss, crashes and wrong output.
+- **No telemetry by default**: nothing is sent unless you pass `--enable-telemetry`.
 
 Binaries for Linux, macOS and Windows (default and mzPeak variants) are on the [releases page](https://github.com/okohlbacher/sage/releases). Every change is listed in the [CHANGELOG](CHANGELOG.md). If you use Sage, please cite the original paper (see [Citation](#citation)).
 

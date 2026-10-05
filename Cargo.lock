@@ -3714,7 +3714,7 @@ dependencies = [
 
 [[package]]
 name = "sage-cli"
-version = "0.15.0-fork.3"
+version = "0.15.0-fork.4"
 dependencies = [
  "anyhow",
  "clap",
@@ -3740,7 +3740,7 @@ dependencies = [
 
 [[package]]
 name = "sage-cloudpath"
-version = "0.15.0-fork.3"
+version = "0.15.0-fork.4"
 dependencies = [
  "async-compression",
  "base64 0.13.1",
@@ -3772,7 +3772,7 @@ dependencies = [
 
 [[package]]
 name = "sage-core"
-version = "0.15.0-fork.3"
+version = "0.15.0-fork.4"
 dependencies = [
  "dashmap",
  "fnv",

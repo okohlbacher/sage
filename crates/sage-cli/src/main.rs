@@ -89,10 +89,16 @@ fn main() -> anyhow::Result<()> {
                 .help("Write `.html` report file"),
         )
         .arg(
+            Arg::new("enable-telemetry")
+                .long("enable-telemetry")
+                .action(clap::ArgAction::SetTrue)
+                .help("Send an anonymous usage record (version, run time, OS, CPUs, database size) to the upstream Sage developers. Off by default in this fork"),
+        )
+        .arg(
             Arg::new("disable-telemetry")
                 .long("disable-telemetry-i-dont-want-to-improve-sage")
-                .action(clap::ArgAction::SetFalse)
-                .help("Disable sending telemetry data"),
+                .action(clap::ArgAction::SetTrue)
+                .help("Accepted for compatibility: telemetry is off unless --enable-telemetry is given"),
         )
         .arg(
             Arg::new("stack-size")
@@ -127,10 +133,9 @@ fn main() -> anyhow::Result<()> {
         .max(1) as usize; // num_cpus/2 is 0 on a single-CPU machine
 
     let parquet = matches.get_one::<bool>("parquet").copied().unwrap_or(false);
-    let send_telemetry = matches
-        .get_one::<bool>("disable-telemetry")
-        .copied()
-        .unwrap_or(true);
+    // Telemetry is opt-in in this fork; the upstream opt-out flag still wins if both are given.
+    let send_telemetry =
+        matches.get_flag("enable-telemetry") && !matches.get_flag("disable-telemetry");
 
     let input = Input::from_arguments(matches)?;
 

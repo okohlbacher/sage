@@ -85,6 +85,8 @@ Options:
           Write parquet files instead of tab-separated files
       --write-pin
           Write percolator-compatible `.pin` output files
+      --enable-telemetry
+          Send an anonymous usage record to the upstream Sage developers. Off by default in this fork
   -h, --help
           Print help information
   -V, --version
