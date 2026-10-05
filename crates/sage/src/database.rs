@@ -1037,6 +1037,10 @@ where
     }
 
     // pass 2: every fragment straight into its group's range of its bin
+    // The release hook ran before the count (`build_index`), but mimalloc v3 lets one
+    // thread purge at a time and skips a forced purge while another thread's purge runs:
+    // a second chance right before the largest allocation of the run
+    release_freed_memory();
     let mut fragments: Vec<Theoretical> = Vec::with_capacity(total);
     advise_huge_pages(fragments.spare_capacity_mut());
     struct Out(*mut Theoretical);
