@@ -23,8 +23,8 @@
 //! Cross-fitting: the spectra of a file are split in two folds by the parity of their index
 //! (among the file's spectra with PSMs, in file order). Each fold trains its own model, and
 //! every PSM is scored by the model of the *other* fold, so no PSM is scored by a model it
-//! helped to train. A file whose folds have fewer than `min_training_psms` training PSMs each
-//! (or no decoy PSM at all) gets neutral features (0).
+//! helped to train. A file with fewer than `min_training_psms` training PSMs in either fold (or
+//! no rank-1 decoy PSM) gets neutral features (0).
 //!
 //! The model follows ProSE's `FragmentIonLikelihoodModel` ("rich" contexts, back-off smoothing
 //! with a pseudo-count of 20). All counting is integer and every PSM is scored sequentially, so
@@ -181,7 +181,10 @@ struct Matcher<'a> {
 }
 
 impl Matcher<'_> {
-    /// Half-width of the matching window around `x`
+    /// Half-width of the matching window around `x`: half the total width of the fragment
+    /// tolerance, centred on the theoretical m/z. For an asymmetric tolerance this differs from
+    /// Sage's own matching windows on purpose; it is more robust when the asymmetry does not
+    /// reflect a real mass offset (see DOCS.md, "Fragment-ion model").
     fn width(&self, x: f32) -> f64 {
         match self.tolerance {
             Tolerance::Ppm(lo, hi) => x as f64 * ((hi - lo) as f64 / 2.0) * 1e-6,
@@ -596,6 +599,11 @@ pub fn annotate(
             select_training(features, &rank1[1]),
         ];
         let sizes = [training[0].len(), training[1].len()];
+        // Trained only if each fold has `min_training_psms` training PSMs and the file has a
+        // rank-1 decoy; otherwise every PSM of the file gets 0. The gate is per file (as in
+        // ProSE): a fold's own labels can decide it, but only as one file-level bit that is the
+        // same for targets and decoys. Per-fold gating would give features to only half of
+        // such a file.
         let trained = has_decoys && sizes.iter().all(|&n| n >= min_training_psms);
         summaries.push(IonModelSummary {
             file_id,

@@ -150,7 +150,9 @@ pub fn read_mzml_levels(
 /// instead of the whole file's (~1.5 GB for a 60 min ddaPASEF run). Local, uncompressed
 /// mzML files are parsed in parallel chunks, each processed right away
 /// ([`crate::mzml_parallel`]; same spectra); gzipped and remote files, and files that
-/// module does not cut, are parsed serially. `SAGE_MZML_SERIAL=1` forces the serial parse.
+/// module does not cut, are parsed serially. `SAGE_MZML_SERIAL` set to any value except `0`
+/// (e.g. `SAGE_MZML_SERIAL=1`) forces the serial parse; the reason for a serial parse is
+/// logged at debug level.
 pub fn read_processed<T: Send>(
     url: &Url,
     file_id: usize,

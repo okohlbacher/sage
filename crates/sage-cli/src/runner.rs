@@ -42,6 +42,11 @@ fn build_database(parameters: Parameters, fasta: Fasta) -> IndexedDatabase {
 }
 
 pub struct Runner {
+    /// The database the search runs against. When `database.prefilter` is off and every input
+    /// file fits into the first batch, its fragment index holds only the fragments of the
+    /// peptides reachable from those spectra's precursor windows under the parameters given to
+    /// [`Runner::new`] (the peptide list stays complete). Do not use it to score other spectra
+    /// or with other precursor tolerances, charges or isotope errors.
     pub database: IndexedDatabase,
     pub parameters: Search,
     start: Instant,
@@ -50,6 +55,9 @@ pub struct Runner {
 }
 
 impl Runner {
+    /// Build the database and read the first batch of spectra. The fragment index may be
+    /// pruned to that batch (see [`Runner::database`]), so call [`Runner::run`] (or
+    /// [`Runner::run_then_exit`]) with the same `parallel` and unchanged `parameters`.
     pub fn new(parameters: Search, parallel: usize) -> anyhow::Result<Self> {
         let mut parameters = parameters.clone();
         let start = Instant::now();
