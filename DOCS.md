@@ -510,7 +510,7 @@ Note on the settings below:
   - The fragment index of each chunk is returned to the operating system before the next chunk is digested.
   - On two of the benchmark files (Velos and Astral) at 64 threads, prefilter mode was 1.8x faster than v0.15.0-fork.2 and peaked 0.24-0.42 GiB lower.
 - **Allocator**: Sage uses mimalloc, which keeps freed memory for a while before returning it to the operating system. Sage asks it to return freed memory before the peptide sort and before the fragment index is allocated.
-  - With several gzipped files in one batch at 64-128 threads, where the index is often not pruned before it is allocated, peak memory occasionally rose about 1 GiB above that of earlier versions. Since the second release point was added, this did not happen in 100 benchmark runs, but it did in one of 22 profiled runs.
+  - With several gzipped (or otherwise serially parsed) files in one batch at 64-128 threads, where the index is often not pruned before it is allocated, peak memory occasionally rose 1.0-1.2 GiB above v0.15.0-fork.2. Since the second release point was added, this did not happen in 100 benchmark runs, but it did in one of 22 profiled runs (about 1 GiB above v0.15.0-fork.2).
   - `MIMALLOC_ARENA_EAGER_COMMIT=0` makes mimalloc commit memory as it is used, which lowers peak memory at high thread counts at some cost in speed.
 
 # Interpreting Sage Output
@@ -571,7 +571,7 @@ With `"ion_model": true`, Sage learns, for every input file, how the fragment io
   - The folds are assigned per spectrum, not per peptide. A peptide identified in spectra of both folds is therefore scored partly by a model trained on its other observations. On the held-out data, 7% of the rank-1 target PSMs are in that situation. Leaving such peptides out of the other fold's training changed the yield by +0.06% and the doubled-database FDP by +0.008 points, so no measurable effect.
   - A file gets features only if both folds have at least 100 training PSMs and the file has a rank-1 decoy PSM. Otherwise every PSM of the file gets 0, and a warning is logged. The gate is per file, as in ProSE: one bit per file, the same for targets and decoys. All 40 benchmark and held-out files were trained, with at least a 4x margin.
 - **Cost**: time and memory grow with the number of MS2 spectra and peaks.
-  - Time: building the peak lists while the files are read, then training and applying the model, took about 15-25 µs per MS2 spectrum at 4 threads (`report_psms` 10). On the release build, that was +2.4% wall time on the 20 benchmark files at 4 threads (per file +0.1% to +4.4%), and +2.5% / +4.5% on 24,000 Astral spectra at 16 / 64 threads.
+  - Time: building the peak lists while the files are read, then training and applying the model, took about 15-25 µs per MS2 spectrum at 4 threads (`report_psms` 10). On the release build (with `max_peaks: "auto"` in both arms), that was +2.4% wall time on the 20 benchmark files at 4 threads (per file +0.1% to +4.4%), and +2.5% / +4.5% on 24,000 Astral spectra at 16 / 64 threads.
   - Memory: the peak lists take about 5 bytes per deisotoped peak (about 4.5 KB per Astral MS2 spectrum). They are kept for every MS2 spectrum of a batch until the batch has been searched, about 40 MB per 8,000 Astral spectra and 0.35 GiB per 72,000.
     - Peak memory rose by 0.13 GiB on 24,000 Astral spectra.
     - A batch of twelve 72,000-spectrum Astral files peaked at 28.5 instead of 24.4 GiB.

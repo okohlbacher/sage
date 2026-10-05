@@ -29,7 +29,7 @@ Data behind the numbers in this section:
   - Error control: on the 20 files, the doubled-database FDP fell (1.08% -> 1.03%) and the Velos UPS1 FDP rose (1.20% -> 1.25%). On held-out, the Velos UPS1 FDP fell (1.06% -> 0.95%), but the doubled-database FDP rose by 0.070 points (1.00% -> 1.07%). That is above the pre-registered limit of +0.05 points, so `"auto"` did not become the default. The excess is about 1.5 standard errors and is not significant.
   - Wide-window and DIA-style searches: with 400 peaks, wrong candidates from the wide isolation window win more often. Percolator PSMs fell by 3-46% on HF-X, timsTOF and Astral files (Astral -46%). On a public diaPASEF run (PXD017703), they fell by 12-16% at 1.9x the run time. `"auto"` therefore resolves to 150 with `wide_window`.
   - Time: on the 20 files at 4 threads, the total stays about the same (+0.2%). High-resolution files take up to 7.7% longer and 0.5 Da files up to 7.0% less, because building the index takes most of those runs. The search phase itself takes 70-80% longer on Astral spectra (0.46-0.48 -> 0.82-0.84 s per file), so larger high-resolution inputs take longer. On 24,000 Astral spectra, runs took 7-12% longer at 4-64 threads; on 24,000 Velos spectra (80 peaks), they were 9-11% shorter.
-  - Memory: the extra peaks are held for every MS2 spectrum of a batch. That is about 0.30 GiB per full-size Astral run (about 120,000 MS2 spectra) in a batch, or 0.50 GiB with `report_psms` 10. By default all files of a run form one batch (`--batch-size` = CPUs/2). A smaller `--batch-size` or `max_peaks: 150` bounds it.
+  - Memory: the extra peaks are held for every MS2 spectrum of a batch. That is about 0.30 GiB per full-size Astral run (about 120,000 MS2 spectra) in a batch, or 0.50 GiB with `report_psms` 10. By default a batch holds CPUs/2 files (`--batch-size`), usually all files of a run. A smaller `--batch-size` or `max_peaks: 150` bounds it.
   - `"auto"` decides by the unit of `fragment_tol` only. For other cases (e.g. low-resolution spectra searched with a ppm tolerance), set a number.
 - `ion_model` (default false; experimental): a self-trained, cross-fitted fragment-ion likelihood model (after ProSE's `FragmentIonLikelihoodModel`). It adds the features `ion_llr` and `ion_explained` to results.sage.tsv, results.sage.parquet and the PIN file.
   - For each file, the model learns how the fragment ions of confidently identified peptides show up in the spectra: all deisotoped peaks, before the `max_peaks` cut, compared against a reversed-sequence noise model.
@@ -38,7 +38,7 @@ Data behind the numbers in this section:
   - Identifications (`max_peaks` 150): +5.2% PSMs on the 20 files (Astral +24%) and +5.5% on held-out (Astral +25%).
   - Error control was not confirmed on held-out data, so the option is not recommended. The Velos UPS1 FDP rose from 1.06% to 1.30%: all three Velos files and all 20 seeds went up, and the pre-registered limit was 1.16%. The doubled-database FDP rose by only 0.03 points (1.00% -> 1.03%). On the 20 files the two measures went from 1.20% to 1.27% and from 1.08% to 1.09%.
   - Together with `max_peaks: "auto"`: +6.4% PSMs on the 20 files and +6.0% on held-out, but the held-out doubled-database FDP rose by 0.077 points.
-  - Cost: +2.4% wall time on the 20 files at 4 threads. On 24,000 Astral spectra: +2.5% at 16 threads and +4.5% at 64, with +0.13 GiB peak memory.
+  - Cost (measured with `max_peaks: "auto"` in both arms): +2.4% wall time on the 20 files at 4 threads. On 24,000 Astral spectra: +2.5% at 16 threads and +4.5% at 64, with +0.13 GiB peak memory.
   - Memory: the peak lists of all MS2 spectra of a batch stay in memory until the batch is searched, about 0.35 GiB per 72,000 Astral spectra. Twelve such files in one batch peaked at 28.5 instead of 24.4 GiB. A smaller `--batch-size` bounds it.
   - DOCS.md describes the design limits: the match window is centred on the theoretical mass, the folds are assigned per spectrum rather than per peptide, and the training gate applies to the whole file.
 - Parallel mzML parse: local, uncompressed mzML files are parsed in parallel chunks of whole spectra, and the spectra are the same as with the serial parse.
@@ -61,7 +61,7 @@ Data behind the numbers in this section:
     - 2.29x at 128 (18.6 -> 8.1 s). On files this small, 128 threads are 8% slower than 64.
   - larger inputs:
     - 24,000 spectra (three Astral or three Velos files concatenated): 1.44x, 1.79x and 2.01x at 4, 16 and 64 threads;
-    - 72,000 Astral spectra: 1.29x at 4 threads, 2.09x at 16 and 2.8-3.2x at 64-128;
+    - 72,000 Astral spectra (the three Astral files, three times over): 1.29x at 4 threads, 2.0-2.1x at 16 and 2.8-3.2x at 64-128;
     - three files in one call (default batch): 1.83x at 16 threads and 2.02x at 64;
     - a gzipped 24,000-spectrum Astral file: 1.38x, 1.32x and 1.19x at 8, 16 and 64 threads.
   - Where the gain comes from:
@@ -76,9 +76,9 @@ Data behind the numbers in this section:
   - The build does not wait for the read. It prunes at the first of three points (before counting the fragments, after counting, before bucketing) at which all spectra have been read.
   - If the read is still going after the last point, the full index is built. This is typical for gzipped, remote or otherwise serially parsed input at high thread counts. Multi-batch runs and the prefilter also build the full index, as before.
   - The telemetry field `fragments` now reports the indexed (pruned) count.
-- Peak memory is 0.6-2.0 GiB below fork.2 in every benchmark run of plain mzML files (e.g. 72,000 Astral spectra: 5.6-6.0 -> 4.5-5.4 GiB). Exceptions:
+- Peak memory is 0.6-2.0 GiB below fork.2 in every default-mode benchmark run of plain mzML files (e.g. 72,000 Astral spectra: 5.6-6.0 -> 4.5-5.4 GiB). Exceptions:
   - Gzipped (or otherwise serially parsed) input whose read ends after the index build has started: the full index is built, and peak memory is level with fork.2 or slightly above it. That is +0.03 to +0.11 GiB for a gzipped 24,000-spectrum Astral file at 8-64 threads, and up to +0.5 GiB for three full gzipped Lumos LFQ runs (with MS1 and LFQ) in one batch at 32 threads.
-  - Several gzipped files in one batch at 64-128 threads: release candidates occasionally peaked 1.0-1.2 GiB above fork.2 (5 of 59 runs). Freed memory is now also returned right before the fragment index is allocated. After that change, no such peak occurred in 100 benchmark runs, but one of 22 profiled runs still reached about 1 GiB above fork.2. Such peaks are now rare, but they still occur.
+  - Several gzipped (or otherwise serially parsed) files in one batch at 64-128 threads: release candidates occasionally peaked 1.0-1.2 GiB above fork.2 (5 of 59 runs that could not prune before allocating the index). Freed memory is now also returned right before the fragment index is allocated. After that change, no such peak occurred in 100 benchmark runs, but one of 22 profiled runs still reached about 1 GiB above fork.2. Such peaks are now rare, but they still occur.
   - `max_peaks: "auto"` and `ion_model` hold more memory per MS2 spectrum of a batch (see Added).
 - Prefilter mode (`database.prefilter: true`) is 1.8x faster than fork.2 at 64 threads, with 0.24-0.42 GiB lower peak memory (velos_125_R1 and astral_B1 of the 20 files). Each FASTA chunk's index is now returned to the OS before the next chunk is digested; without that step, the faster build peaked 0.09-0.13 GiB above fork.2.
 - The end of a run is faster (about 0.1-0.3 s per run, more with more PSMs; output unchanged):
