@@ -5,17 +5,116 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+
+## [v0.15.0-fork.3] - 2026-10-05
+
+Faster, with the same results: with the same settings, every result and PIN file in the benchmark runs below is byte-identical to fork.2's. The defaults are unchanged. `max_peaks` stays 150, and the two new quality options are opt-in.
+
+Data behind the numbers in this section:
+- **The 20 files**: the public benchmark of OpenMS issue #10364, 8,000 MS2 spectra from each of 20 public runs (PXD001819 Velos UPS1, ProteoBench HF-X and Astral, PXD007683 Lumos LFQ and TMT, PXD054559 Eclipse TMTpro, PXD053748 timsTOF), plus larger inputs built from these files.
+- **Held-out**: another 8,000 spectra from each of the same 20 runs, disjoint from the 20 files (ranks 8,001-16,000 of the benchmark's own selection rule).
+- **Identifications**: Percolator 3.09 on Sage's PIN file, 20 seeds, target PSMs at 1% FDR, mean per file.
+- **Error control**: the doubled-database entrapment FDP, pooled over three shuffles, and the natural entrapment FDP of the three Velos UPS1 runs.
+- **Timings**: AMD EPYC 7763 (64 cores, 128 threads), idle, warm page cache. fork.2 and fork.3 alternate in paired ABBA blocks; the numbers are medians.
+
 ### Added
-- `ion_model` setting (default false): a self-trained, cross-fitted fragment-ion likelihood model (after ProSE's `FragmentIonLikelihoodModel`) adds the features `ion_llr` and `ion_explained` to results.sage.tsv and the PIN file. Evidence is every deisotoped peak (before the `max_peaks` cut); the model is trained per file on its confident PSMs and every PSM is scored by the model of the other half of the file. Also written to results.sage.parquet. With Percolator on the 20 public files of OpenMS#10364: +5.2% PSMs at 1% FDR (Astral +24%), doubled-database entrapment FDP 1.08% -> 1.09%. All other output is unchanged.
-- mzPeak input (`.mzpeak`, optional cargo feature `mzpeak`): read through the HUPO-PSI reference reader (`mzpeak_prototyping`) and `mzdata`. Needs the reader built without its `bruker` feature (not upstream yet; local checkout of HUPO-PSI/mzPeak, branch `optional-bruker`). Results are identical to searching the same data as mzML. Grid-encoded timsTOF mzPeak files are not supported in this configuration.
-- Per-modification occurrence limits using `{"mass": <mass>, "max_count": <limit>}` entries in `database.variable_mods`; existing bare-mass entries remain supported.
-- `database.max_combinations` to cap the number of peptide variants (including the unmodified form) generated from variable modifications, preferring variants with fewer modifications.
+- `max_peaks: "auto"` (opt-in; the default stays 150). It resolves to:
+  - 400 peaks per MS2 spectrum for a ppm or pct `fragment_tol`, or for a Da tolerance narrower than 0.1 Da;
+  - 80 for a Da tolerance that reaches 0.1 Da on one side (low-resolution fragments), or 150 in that case if TMT reporter ions are quantified at MS2;
+  - 150 with `wide_window`;
+  - never fewer than `min_peaks`: it is raised to it, and the log says so.
+
+  The resolved number is logged and written to `results.json`. Other strings, negative and fractional numbers are rejected with an error that names the accepted values.
+  - Identifications: +2.26% PSMs on the 20 files (Astral +10.8%, Lumos LFQ -0.1%) and +2.38% on held-out (Astral +7.7%, Lumos LFQ +0.4%).
+  - Error control: on the 20 files, the doubled-database FDP fell (1.08% -> 1.03%) and the Velos UPS1 FDP rose (1.20% -> 1.25%). On held-out, the Velos UPS1 FDP fell (1.06% -> 0.95%), but the doubled-database FDP rose by 0.070 points (1.00% -> 1.07%). That is above the pre-registered limit of +0.05 points, so `"auto"` did not become the default. The excess is about 1.5 standard errors and is not significant.
+  - Wide-window and DIA-style searches: with 400 peaks, wrong candidates from the wide isolation window win more often. Percolator PSMs fell by 3-46% on HF-X, timsTOF and Astral files (Astral -46%). On a public diaPASEF run (PXD017703), they fell by 12-16% at 1.9x the run time. `"auto"` therefore resolves to 150 with `wide_window`.
+  - Time: on the 20 files at 4 threads, the total stays about the same (+0.2%). High-resolution files take up to 7.7% longer and 0.5 Da files up to 7.0% less, because building the index takes most of those runs. The search phase itself takes 70-80% longer on Astral spectra (0.46-0.48 -> 0.82-0.84 s per file), so larger high-resolution inputs take longer. On 24,000 Astral spectra, runs took 7-12% longer at 4-64 threads; on 24,000 Velos spectra (80 peaks), they were 9-11% shorter.
+  - Memory: the extra peaks are held for every MS2 spectrum of a batch. That is about 0.30 GiB per full-size Astral run (about 120,000 MS2 spectra) in a batch, or 0.50 GiB with `report_psms` 10. By default all files of a run form one batch (`--batch-size` = CPUs/2). A smaller `--batch-size` or `max_peaks: 150` bounds it.
+  - `"auto"` decides by the unit of `fragment_tol` only. For other cases (e.g. low-resolution spectra searched with a ppm tolerance), set a number.
+- `ion_model` (default false; experimental): a self-trained, cross-fitted fragment-ion likelihood model (after ProSE's `FragmentIonLikelihoodModel`). It adds the features `ion_llr` and `ion_explained` to results.sage.tsv, results.sage.parquet and the PIN file.
+  - For each file, the model learns how the fragment ions of confidently identified peptides show up in the spectra: all deisotoped peaks, before the `max_peaks` cut, compared against a reversed-sequence noise model.
+  - The spectra are split into two folds, and every PSM is scored by the model of the other fold.
+  - The features are meant for Percolator or mokapot; Sage's own LDA does not use them. All other output is unchanged.
+  - Identifications (`max_peaks` 150): +5.2% PSMs on the 20 files (Astral +24%) and +5.5% on held-out (Astral +25%).
+  - Error control was not confirmed on held-out data, so the option is not recommended. The Velos UPS1 FDP rose from 1.06% to 1.30%: all three Velos files and all 20 seeds went up, and the pre-registered limit was 1.16%. The doubled-database FDP rose by only 0.03 points (1.00% -> 1.03%). On the 20 files the two measures went from 1.20% to 1.27% and from 1.08% to 1.09%.
+  - Together with `max_peaks: "auto"`: +6.4% PSMs on the 20 files and +6.0% on held-out, but the held-out doubled-database FDP rose by 0.077 points.
+  - Cost: +2.4% wall time on the 20 files at 4 threads. On 24,000 Astral spectra: +2.5% at 16 threads and +4.5% at 64, with +0.13 GiB peak memory.
+  - Memory: the peak lists of all MS2 spectra of a batch stay in memory until the batch is searched, about 0.35 GiB per 72,000 Astral spectra. Twelve such files in one batch peaked at 28.5 instead of 24.4 GiB. A smaller `--batch-size` bounds it.
+  - DOCS.md describes the design limits: the match window is centred on the theoretical mass, the folds are assigned per spectrum rather than per peptide, and the training gate applies to the whole file.
+- Parallel mzML parse: local, uncompressed mzML files are parsed in parallel chunks of whole spectra, and the spectra are the same as with the serial parse.
+  - Gzipped and remote files, and files with an unusual layout (comments, CDATA or processing instructions between the spectra), are parsed serially.
+  - Setting the environment variable `SAGE_MZML_SERIAL` to any value except `0` (e.g. `SAGE_MZML_SERIAL=1`) forces the serial parse. The reason a file is parsed serially is logged at debug level (`SAGE_LOG=sage_cloudpath=debug`).
+  - Local files of every format are read in 2 MiB reads instead of object_store's 8 KiB stream. A local file that cannot be opened is named in the error.
+  - Speed, measured on this change alone against fork.2 on 72,000 Astral spectra: 1.42x faster at 16 threads (13.9 -> 9.8 s), 1.63x at 64 (11.7 -> 7.2 s) and 1.61x at 128.
+  - In this release, the parallel parse is neutral on the 8,000-spectrum files at 64-128 threads (20-file sums 1.007x and 1.001x against the same binary with `SAGE_MZML_SERIAL=1`). It is 1-6% faster when one call reads three such files. The small costs measured on this change alone in those cases (0.5-2.8%) do not occur in the release.
+  - Memory is bounded by the chunks being parsed, not by the whole file's raw spectra. This also holds when a long tail follows the spectra (chromatograms, index).
+  - Each file is read twice: a scan for spectrum boundaries, then the chunks. The second read comes from the page cache, unless the files of a batch do not fit in free memory; then the device reads them twice.
+  - On storage slower than about 300 MB/s (HDD, 1 GbE network shares), that can make the parallel parse slower than the serial one. Use `SAGE_MZML_SERIAL=1` or a smaller `--batch-size` there. On local NVMe and on Ceph, the parallel parse stayed 3.3-4.5x faster than the serial one even when the file was read twice.
 
 ### Changed
-- `max_peaks` accepts `"auto"`, the new default (was a fixed 150): 80 peaks per MS2 spectrum for a Da `fragment_tol` reaching at least 0.1 Da on one side (low-resolution fragments; 150 if TMT reporter ions are quantified from MS2, so that none are dropped), 400 otherwise (ppm, pct, or a narrow Da tolerance such as 0.02 Da). On the 20 public files of the OpenMS benchmark (OpenMS#10364; Percolator 3.09, 20 seeds, 1% FDR) this gives 2.26% more PSMs per file (3146.5 -> 3217.6; Astral +10.8%, Lumos LFQ -0.1%), a lower doubled-database entrapment FDP (1.08% -> 1.03%, pooled over three shuffles) and a Velos UPS1 entrapment FDP of 1.25% (1.20% before; both above 1%); Sage's own q-values find 2.2% more PSMs. The resolved value is logged and written to `results.json`; an explicit number is used as given (`max_peaks: 150` reproduces earlier results). Time: on those 8,000-spectrum files at 4 threads, where building the fragment index takes most of the run, the total was about the same (0.99x; high-resolution files 0-7% longer, 0.5 Da files 2-10% shorter), but scoring 400 peaks makes the search phase itself about 35-80% longer on high-resolution data (Astral, timsTOF, Exploris), so full-size high-resolution runs take noticeably longer: one complete Astral run (122,659 MS2 spectra, gzipped mzML) took 13% longer at 4 threads and 5.5% longer at 16, with 0.3-0.65 GiB more peak memory (single node under load, indicative). `max_peaks: 150` restores the former speed. Library API: `sage_cli::input::Input::max_peaks` is now an `Option<MaxPeaks>` (`MaxPeaks::Auto` or `MaxPeaks::Count(n)`) instead of an `Option<usize>`.
-- Performance: about 4.6-5.8x faster end to end (128/64/16 threads: 35.1/41.7/88.7 s -> 7.6/7.2/15.3 s) and 2.2-3.6 GiB lower peak memory on a 3-file timsTOF DDA benchmark (human, 7.7 M peptides), with identical identifications. Isotope windows share one fragment lookup, a per-page skip table narrows fragment lookups, lookups are pipelined with software prefetch, full rescoring walks the peaks with a cursor instead of a binary search per ion, KDE fits parallelise over bins, the fragment index is built in one exact-size allocation on transparent huge pages, digest grouping is parallel, spectra are processed per file, the database build overlaps with reading the first batch, the database is not freed at exit, output is serialized in parallel, and mimalloc is the global allocator. Bruker DDA: each MS2 frame is decoded once per block of spectra (timsrust decoded it once per precursor, ~9 times), frames are read without a memory map, spectra are processed while the file is read, and up to 4 `.d` files are read at a time.
-- Reading: local, uncompressed mzML files are parsed in parallel chunks of whole spectra (gzipped, remote and unusually laid-out files keep the serial parser; `SAGE_MZML_SERIAL=1` forces it), and local files are read in 2 MiB reads instead of object_store's 8 KiB stream. Identical results; on 72,000 Astral spectra (EPYC 7763) 1.42x faster at 16 threads, 1.63x at 64 and 1.61x at 128 (13.9 -> 9.8 s, 11.7 -> 7.2 s, 11.8 -> 7.3 s), on the 8,000-spectrum benchmark files at 4 threads 1.2%. Measured on this change alone, it costs about 1-2% on 8,000-spectrum files at 64-128 threads and 1.7-2.8% when a batch reads several such small files at once (the default `--batch-size` reads CPUs/2 files together), where the read was already hidden behind the database build; with `--batch-size 1` three such files were 1.27-1.33x faster.
-- The end of a run is faster: the system query for telemetry runs only when the report is sent, the search results are left to the OS at exit, and protein names for protein-level FDR are formatted once per protein (about 0.1-0.3 s per run, more with more PSMs; output unchanged).
+- Performance, with identical results (`max_peaks` 150 in both builds):
+  - the 20 files at 4 threads: 220.8 -> 131.0 s (1.69x; every file 1.59-1.78x). CPU time 720 -> 470 s (-35%); peak memory 0.7-1.0 GiB lower per file (3.3-4.5 -> 2.6-3.7 GiB);
+  - by thread count, on 4 of the files (Velos, HF-X, Astral, timsTOF):
+    - 1.61x at 1 thread (129.6 -> 80.7 s);
+    - 2.10x at 16 (21.9 -> 10.4 s);
+    - 2.45x at 64 (18.5 -> 7.5 s);
+    - 2.29x at 128 (18.6 -> 8.1 s). On files this small, 128 threads are 8% slower than 64.
+  - larger inputs:
+    - 24,000 spectra (three Astral or three Velos files concatenated): 1.44x, 1.79x and 2.01x at 4, 16 and 64 threads;
+    - 72,000 Astral spectra: 1.29x at 4 threads, 2.09x at 16 and 2.8-3.2x at 64-128;
+    - three files in one call (default batch): 1.83x at 16 threads and 2.02x at 64;
+    - a gzipped 24,000-spectrum Astral file: 1.38x, 1.32x and 1.19x at 8, 16 and 64 threads.
+  - Where the gain comes from:
+    - The fragment index is built by m/z bins with counting sorts, instead of one global sort. Its pages are radix-sorted by peptide.
+    - Only the fragments of peptides that a precursor window can reach are indexed (see the next item).
+    - Digest groups are built in parallel. The fork.2 notes already listed this, but that change had been reverted before fork.2 was released.
+    - The peptide sort goes through 16-byte keys, and duplicates are merged in parallel.
+    - Freed memory is returned to the OS before the peptide sort and before the fragment index is allocated.
+    - Local mzML files are parsed in parallel (see Added), and the end of a run is faster (see below).
+- Fragment index pruning applies when every input file is read in the first batch (at most `--batch-size` files, by default CPUs/2) and `database.prefilter` is off.
+  - The index then holds only the fragments of peptides that a precursor window of those spectra can reach. On the 20 files, that drops 35-64% of the fragments. The peptide list stays complete, and the results are identical.
+  - The build does not wait for the read. It prunes at the first of three points (before counting the fragments, after counting, before bucketing) at which all spectra have been read.
+  - If the read is still going after the last point, the full index is built. This is typical for gzipped, remote or otherwise serially parsed input at high thread counts. Multi-batch runs and the prefilter also build the full index, as before.
+  - The telemetry field `fragments` now reports the indexed (pruned) count.
+- Peak memory is 0.6-2.0 GiB below fork.2 in every benchmark run of plain mzML files (e.g. 72,000 Astral spectra: 5.6-6.0 -> 4.5-5.4 GiB). Exceptions:
+  - Gzipped (or otherwise serially parsed) input whose read ends after the index build has started: the full index is built, and peak memory is level with fork.2 or slightly above it. That is +0.03 to +0.11 GiB for a gzipped 24,000-spectrum Astral file at 8-64 threads, and up to +0.5 GiB for three full gzipped Lumos LFQ runs (with MS1 and LFQ) in one batch at 32 threads.
+  - Several gzipped files in one batch at 64-128 threads: release candidates occasionally peaked 1.0-1.2 GiB above fork.2 (5 of 59 runs). Freed memory is now also returned right before the fragment index is allocated. After that change, no such peak occurred in 100 benchmark runs, but one of 22 profiled runs still reached about 1 GiB above fork.2. Such peaks are now rare, but they still occur.
+  - `max_peaks: "auto"` and `ion_model` hold more memory per MS2 spectrum of a batch (see Added).
+- Prefilter mode (`database.prefilter: true`) is 1.8x faster than fork.2 at 64 threads, with 0.24-0.42 GiB lower peak memory (velos_125_R1 and astral_B1 of the 20 files). Each FASTA chunk's index is now returned to the OS before the next chunk is digested; without that step, the faster build peaked 0.09-0.13 GiB above fork.2.
+- The end of a run is faster (about 0.1-0.3 s per run, more with more PSMs; output unchanged):
+  - the system query for telemetry runs only when the report is sent;
+  - the `sage` binary leaves the search results to the OS at exit;
+  - protein names for protein-level FDR are formatted once per protein.
+- The crates are versioned 0.15.0-fork.3, so `sage --version`, `results.json` and the telemetry record name the release. fork.2's binaries reported 0.15.0-beta.2.
+- The declared minimum Rust versions now match a `--locked` build: sage-core 1.80, sage-cloudpath 1.85 and sage-cli 1.88 (also needed for `--features mzpeak`). They were 1.62, which the code had outgrown.
+- Library API (sage-core, sage-cloudpath, sage-cli):
+  - `sage_cli::input::Input::max_peaks` is an `Option<MaxPeaks>` (`MaxPeaks::Auto` or `MaxPeaks::Count(n)`) instead of an `Option<usize>`. `MaxPeaks::default()` is `Count(150)` (`MaxPeaks::DEFAULT`). `MaxPeaks::resolve(fragment_tol, tmt_ms2, wide_window)` returns the number of peaks.
+  - New public fields:
+    - `ProcessedSpectrum::ion_evidence` (`Option<Box<IonEvidence>>`);
+    - `SpectrumProcessor::ion_evidence` (set with `with_ion_evidence`);
+    - `Feature::{normalized_hyperscore, ion_llr, ion_explained}` (the JSON of a `Feature` gains `ion_llr` and `ion_explained`);
+    - `Search::ion_model` and `Input::ion_model`.
+  - New module `sage_core::ion_model`. `sage_cloudpath::parquet::build_schema` and `serialize_features` take an `ion_model` flag.
+  - `Runner::new` may return a `database` whose fragment index covers only the peptides reachable from the first batch's spectra, under the parameters given to `new`. Call `run` with the same `parallel` and unchanged `parameters`, and do not use `runner.database` to score other spectra or to search with other tolerances.
+  - `Runner::run` frees the database and the results. `Runner::run_then_exit` leaves them to the OS, for a process that exits right after it (the `sage` binary).
+  - `sage_core::database::set_release_freed_memory` registers a function that the database build calls before its large allocations; `sage_core::database::release_freed_memory` calls it. sage-cli registers mimalloc's `mi_collect` (`sage_cli::release_freed_memory`).
+  - `Telemetry` fills in the OS name and the total memory only in `send()`.
+
+### Fixed
+- An explicit `max_peaks` below `min_peaks` now logs a warning. With such a setting no MS2 spectrum can be searched, and the run ended with empty results and exit code 0 without saying why.
+- `Runner::run` (library use) no longer leaks the database. fork.2 kept the database of every call in memory.
+
+## [v0.15.0-fork.2] - 2026-10-01
+
+First release of the fork, based on upstream master 2c9922e (crate version 0.15.0-beta.2).
+
+### Added
+- mzPeak input (`.mzpeak`, optional cargo feature `mzpeak`): read through the HUPO-PSI reference reader (`mzpeak_prototyping`) and `mzdata`. The reader is pinned to the public fork okohlbacher/mzPeak at bfec73a (branch `optional-bruker`), which makes its `bruker` feature optional (not upstream yet). Results are identical to searching the same data as mzML. Grid-encoded timsTOF mzPeak files are not supported in this configuration.
+- From upstream 2c9922e: per-modification occurrence limits using `{"mass": <mass>, "max_count": <limit>}` entries in `database.variable_mods`; existing bare-mass entries remain supported.
+- From upstream 2c9922e: `database.max_combinations` to cap the number of peptide variants (including the unmodified form) generated from variable modifications, preferring variants with fewer modifications.
+
+### Changed
+- Performance: about 4.6-5.8x faster end to end (128/64/16 threads: 35.1/41.7/88.7 s -> 7.6/7.2/15.3 s) and 2.2-3.6 GiB lower peak memory on a 3-file timsTOF DDA benchmark (human, 7.7 M peptides), with identical identifications. Isotope windows share one fragment lookup, a per-page skip table narrows fragment lookups, lookups are pipelined with software prefetch, full rescoring walks the peaks with a cursor instead of a binary search per ion, KDE fits parallelise over bins, the fragment index is built in one exact-size allocation on transparent huge pages, spectra are processed per file, the database build overlaps with reading the first batch, the database is not freed at exit, output is serialized in parallel, and mimalloc is the global allocator. Bruker DDA: each MS2 frame is decoded once per block of spectra (timsrust decoded it once per precursor, ~9 times), frames are read without a memory map, spectra are processed while the file is read, and up to 4 `.d` files are read at a time.
 - mimalloc trades memory for speed at high thread counts; `MIMALLOC_ARENA_EAGER_COMMIT=0` lowers peak memory (by ~1.5 GB at 128 threads in the benchmark) for ~10% more time.
 - Output is deterministic: identical searches give byte-identical result and PIN files, also across thread counts. `psm_id` is the row number of the output (it was a counter shared by the parallel search).
 - mzML: MS1 spectra are no longer decoded or kept unless LFQ is enabled.
