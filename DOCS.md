@@ -456,9 +456,9 @@ Note on the settings below:
   | doubled-database entrapment FDP (three shuffles) | 1.08% -> 1.03% | 1.00% -> 1.07% |
   | Velos UPS1 entrapment FDP | 1.20% -> 1.25% | 1.06% -> 0.95% |
 
-  On the held-out set, the doubled-database FDP rose by 0.070 points, above the pre-registered limit of +0.05 for a default change, so `"auto"` stayed opt-in. The excess is about 1.5 standard errors and is not significant, and the two sets disagree in sign. Sage's own q-values found 2.2% more PSMs on the benchmark files.
+  On the held-out set, the doubled-database FDP rose by 0.070 points, above the pre-registered limit of +0.05 for a default change, so `"auto"` stayed opt-in. The rise is about 1.5 standard errors above zero (0.4-0.6 standard errors above the limit) and is not significant, and the two sets disagree in sign. Sage's own q-values found 2.2% more PSMs on the benchmark files. The gain needs rescoring (Sage's LDA, Percolator or mokapot): filtering on the raw hyperscore alone finds fewer PSMs with 400 peaks on most ppm files.
 
-  Cost, measured against `max_peaks: 150` (AMD EPYC 7763, paired runs):
+  Cost, measured against `max_peaks: 150` (time: AMD EPYC 7763, each arm paired against fork.2; memory: a second node, paired):
   - Time: the search phase scores more peaks. On Astral spectra it takes 70-80% longer (0.46-0.48 -> 0.82-0.84 s per 8,000 spectra at 4 threads); on 0.5 Da data at 80 peaks it is shorter.
     - The 20 benchmark files at 4 threads took about the same total time (+0.2%; high-resolution files -1.4% to +7.7%, 0.5 Da files -3.4% to -7.0%), because building the fragment index takes most of these runs.
     - Larger inputs show more of it: 24,000 Astral spectra took 11.7%, 10.2% and 7.4% longer at 4, 16 and 64 threads, and 24,000 Velos spectra (80 peaks) took 11.0%, 8.6% and 10.5% less.
@@ -484,7 +484,7 @@ Note on the settings below:
     ```
   - Local, uncompressed mzML files are parsed in parallel, in chunks of whole spectra (the spectra are the same as with the serial parse).
     - Gzipped and remote files, and files with comments, CDATA sections or processing instructions between the spectra or another unusual layout, are parsed serially. They are read completely (all raw spectra of a file) before their spectra are processed.
-    - Setting the environment variable `SAGE_MZML_SERIAL` to any value except `0` (e.g. `SAGE_MZML_SERIAL=1`) forces the serial parse. Why a file is parsed serially is logged at debug level (`SAGE_LOG=sage_cloudpath=debug`).
+    - Setting the environment variable `SAGE_MZML_SERIAL` to any value except `0` (e.g. `SAGE_MZML_SERIAL=1`) forces the serial parse. When a local, uncompressed mzML file falls back to the serial parse, the reason is logged at debug level (`SAGE_LOG=sage_cloudpath=debug`).
     - Speed: on 72,000 Astral spectra (AMD EPYC 7763), the parallel parse alone made a run 1.42x faster at 16 threads and 1.6x faster at 64-128. On 8,000-spectrum files it is about neutral.
     - The parallel parse holds only the chunks being parsed in memory. It reads every file twice: first a scan for the spectrum boundaries, then the chunks. The second read normally comes from the page cache.
     - If the files of a batch (all files read together, by default CPUs/2 of them) do not fit into free memory, the second read goes to the storage again. On storage slower than about 300 MB/s (a hard disk, a 1 GbE network share), the parallel parse can then be slower than the serial one; set `SAGE_MZML_SERIAL=1` or a smaller `--batch-size` there. On local NVMe and on Ceph storage, it stayed 3.3-4.5x faster than the serial parse even when the file was read twice.
@@ -571,7 +571,7 @@ With `"ion_model": true`, Sage learns, for every input file, how the fragment io
   - The folds are assigned per spectrum, not per peptide. A peptide identified in spectra of both folds is therefore scored partly by a model trained on its other observations. On the held-out data, 7% of the rank-1 target PSMs are in that situation. Leaving such peptides out of the other fold's training changed the yield by +0.06% and the doubled-database FDP by +0.008 points, so no measurable effect.
   - A file gets features only if both folds have at least 100 training PSMs and the file has a rank-1 decoy PSM. Otherwise every PSM of the file gets 0, and a warning is logged. The gate is per file, as in ProSE: one bit per file, the same for targets and decoys. All 40 benchmark and held-out files were trained, with at least a 4x margin.
 - **Cost**: time and memory grow with the number of MS2 spectra and peaks.
-  - Time: building the peak lists while the files are read, then training and applying the model, took about 15-25 µs per MS2 spectrum at 4 threads (`report_psms` 10). On the release build (with `max_peaks: "auto"` in both arms), that was +2.4% wall time on the 20 benchmark files at 4 threads (per file +0.1% to +4.4%), and +2.5% / +4.5% on 24,000 Astral spectra at 16 / 64 threads.
+  - Time: building the peak lists while the files are read, then training and applying the model, took about 15-25 µs per MS2 spectrum at 4 threads (`report_psms` 10). On a release candidate (with `max_peaks: "auto"` in both arms), that was +2.4% wall time on the 20 benchmark files at 4 threads (per file +0.1% to +4.4%), and +2.5% / +4.5% on 24,000 Astral spectra at 16 / 64 threads.
   - Memory: the peak lists take about 5 bytes per deisotoped peak (about 4.5 KB per Astral MS2 spectrum). They are kept for every MS2 spectrum of a batch until the batch has been searched, about 40 MB per 8,000 Astral spectra and 0.35 GiB per 72,000.
     - Peak memory rose by 0.13 GiB on 24,000 Astral spectra.
     - A batch of twelve 72,000-spectrum Astral files peaked at 28.5 instead of 24.4 GiB.
